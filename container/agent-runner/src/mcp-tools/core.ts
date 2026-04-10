@@ -35,37 +35,52 @@ function destinationList(): string {
   return all.map((d) => d.name).join(', ');
 }
 
+/**
+ * Resolve a destination name to routing fields.
+ * If `to` is omitted and the agent has exactly one destination, that one is used.
+ * With multiple destinations, omitting `to` is an error.
+ */
 function resolveRouting(
-  to: string,
-): { channel_type: string; platform_id: string } | { error: string } {
-  const dest = findByName(to);
-  if (!dest) return { error: `Unknown destination "${to}". Known: ${destinationList()}` };
-  if (dest.type === 'channel') {
-    return { channel_type: dest.channelType!, platform_id: dest.platformId! };
+  to: string | undefined,
+): { channel_type: string; platform_id: string; resolvedName: string } | { error: string } {
+  let name = to;
+  if (!name) {
+    const all = getAllDestinations();
+    if (all.length === 0) return { error: 'No destinations configured.' };
+    if (all.length > 1) {
+      return {
+        error: `You have multiple destinations — specify "to". Options: ${all.map((d) => d.name).join(', ')}`,
+      };
+    }
+    name = all[0].name;
   }
-  return { channel_type: 'agent', platform_id: dest.agentGroupId! };
+  const dest = findByName(name);
+  if (!dest) return { error: `Unknown destination "${name}". Known: ${destinationList()}` };
+  if (dest.type === 'channel') {
+    return { channel_type: dest.channelType!, platform_id: dest.platformId!, resolvedName: name };
+  }
+  return { channel_type: 'agent', platform_id: dest.agentGroupId!, resolvedName: name };
 }
 
 export const sendMessage: McpToolDefinition = {
   tool: {
     name: 'send_message',
     description:
-      'Send a message to a named destination. Use destination names from your system prompt (not raw IDs).',
+      'Send a message to a named destination. If you have only one destination, you can omit `to`.',
     inputSchema: {
       type: 'object' as const,
       properties: {
-        to: { type: 'string', description: 'Destination name (e.g., "family", "worker-1")' },
+        to: { type: 'string', description: 'Destination name (e.g., "family", "worker-1"). Optional if you have only one destination.' },
         text: { type: 'string', description: 'Message content' },
       },
-      required: ['to', 'text'],
+      required: ['text'],
     },
   },
   async handler(args) {
-    const to = args.to as string;
     const text = args.text as string;
-    if (!to || !text) return err('to and text are required');
+    if (!text) return err('text is required');
 
-    const routing = resolveRouting(to);
+    const routing = resolveRouting(args.to as string | undefined);
     if ('error' in routing) return err(routing.error);
 
     const id = generateId();
@@ -78,32 +93,31 @@ export const sendMessage: McpToolDefinition = {
       content: JSON.stringify({ text }),
     });
 
-    log(`send_message: #${seq} → ${to}`);
-    return ok(`Message sent to ${to} (id: ${seq})`);
+    log(`send_message: #${seq} → ${routing.resolvedName}`);
+    return ok(`Message sent to ${routing.resolvedName} (id: ${seq})`);
   },
 };
 
 export const sendFile: McpToolDefinition = {
   tool: {
     name: 'send_file',
-    description: 'Send a file to a named destination.',
+    description: 'Send a file to a named destination. If you have only one destination, you can omit `to`.',
     inputSchema: {
       type: 'object' as const,
       properties: {
-        to: { type: 'string', description: 'Destination name' },
+        to: { type: 'string', description: 'Destination name. Optional if you have only one destination.' },
         path: { type: 'string', description: 'File path (relative to /workspace/agent/ or absolute)' },
         text: { type: 'string', description: 'Optional accompanying message' },
         filename: { type: 'string', description: 'Display name (default: basename of path)' },
       },
-      required: ['to', 'path'],
+      required: ['path'],
     },
   },
   async handler(args) {
-    const to = args.to as string;
     const filePath = args.path as string;
-    if (!to || !filePath) return err('to and path are required');
+    if (!filePath) return err('path is required');
 
-    const routing = resolveRouting(to);
+    const routing = resolveRouting(args.to as string | undefined);
     if ('error' in routing) return err(routing.error);
 
     const resolvedPath = path.isAbsolute(filePath) ? filePath : path.resolve('/workspace/agent', filePath);
@@ -125,8 +139,8 @@ export const sendFile: McpToolDefinition = {
       content: JSON.stringify({ text: (args.text as string) || '', files: [filename] }),
     });
 
-    log(`send_file: ${id} → ${to} (${filename})`);
-    return ok(`File sent to ${to} (id: ${id}, filename: ${filename})`);
+    log(`send_file: ${id} → ${routing.resolvedName} (${filename})`);
+    return ok(`File sent to ${routing.resolvedName} (id: ${id}, filename: ${filename})`);
   },
 };
 

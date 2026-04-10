@@ -73,6 +73,22 @@ export function buildSystemPromptAddendum(): string {
     ].join('\n');
   }
 
+  // Single-destination shortcut: the agent just writes its response normally.
+  // No wrapping needed. This preserves the simple case (one user, one channel).
+  if (cache.length === 1) {
+    const d = cache[0];
+    const label = d.displayName && d.displayName !== d.name ? ` (${d.displayName})` : '';
+    return [
+      '## Sending messages',
+      '',
+      `Your messages are delivered to \`${d.name}\`${label}. Just write your response directly — no special wrapping needed.`,
+      '',
+      'To mark something as scratchpad (logged but not sent), wrap it in `<internal>...</internal>`.',
+      '',
+      'To send a message mid-response (e.g., an acknowledgment before a long task), call the `send_message` MCP tool.',
+    ].join('\n');
+  }
+
   const lines = ['## Sending messages', '', 'You can send messages to the following destinations:', ''];
   for (const d of cache) {
     const label = d.displayName && d.displayName !== d.name ? ` (${d.displayName})` : '';

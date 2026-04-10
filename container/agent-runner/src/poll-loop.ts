@@ -1,4 +1,4 @@
-import { findByName } from './destinations.js';
+import { findByName, getAllDestinations, type DestinationEntry } from './destinations.js';
 import { getPendingMessages, markProcessing, markCompleted, type MessageInRow } from './db/messages-in.js';
 import { writeMessageOut } from './db/messages-out.js';
 import { touchHeartbeat, clearStaleProcessingAcks } from './db/connection.js';
@@ -296,11 +296,14 @@ function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
 /**
  * Parse the agent's final text for <message to="name">...</message> blocks
  * and dispatch each one to its resolved destination. Text outside of blocks
- * (including <internal>...</internal>) is scratchpad — logged but not sent.
+ * (including <internal>...</internal>) is normally scratchpad — logged but
+ * not sent.
  *
- * If the agent emits zero <message> blocks AND non-empty text, log a warning:
- * the agent produced output with no recipient. That's usually a bug in the
- * agent — the system prompt tells it to wrap user-visible text in blocks.
+ * Single-destination shortcut: if the agent has exactly one configured
+ * destination AND the output contains zero <message> blocks, the entire
+ * cleaned text (with <internal> tags stripped) is sent to that destination.
+ * This preserves the simple case of one user on one channel — the agent
+ * doesn't need to know about wrapping syntax at all.
  */
 function dispatchResultText(text: string, routing: RoutingContext): void {
   const MESSAGE_RE = /<message\s+to="([^"]+)"\s*>([\s\S]*?)<\/message>/g;
@@ -324,18 +327,7 @@ function dispatchResultText(text: string, routing: RoutingContext): void {
       scratchpadParts.push(`[dropped: unknown destination "${toName}"] ${body}`);
       continue;
     }
-
-    const platformId = dest.type === 'channel' ? dest.platformId! : dest.agentGroupId!;
-    const channelType = dest.type === 'channel' ? dest.channelType! : 'agent';
-    writeMessageOut({
-      id: generateId(),
-      in_reply_to: routing.inReplyTo,
-      kind: 'chat',
-      platform_id: platformId,
-      channel_type: channelType,
-      thread_id: null,
-      content: JSON.stringify({ text: body }),
-    });
+    sendToDestination(dest, body, routing);
     sent++;
   }
   if (lastIndex < text.length) {
@@ -346,6 +338,17 @@ function dispatchResultText(text: string, routing: RoutingContext): void {
     .join('')
     .replace(/<internal>[\s\S]*?<\/internal>/g, '')
     .trim();
+
+  // Single-destination shortcut: the agent wrote plain text and has exactly
+  // one destination. Send the entire cleaned text to it.
+  if (sent === 0 && scratchpad) {
+    const all = getAllDestinations();
+    if (all.length === 1) {
+      sendToDestination(all[0], scratchpad, routing);
+      return;
+    }
+  }
+
   if (scratchpad) {
     log(`[scratchpad] ${scratchpad.slice(0, 500)}${scratchpad.length > 500 ? '…' : ''}`);
   }
@@ -353,6 +356,20 @@ function dispatchResultText(text: string, routing: RoutingContext): void {
   if (sent === 0 && text.trim()) {
     log(`WARNING: agent output had no <message to="..."> blocks — nothing was sent`);
   }
+}
+
+function sendToDestination(dest: DestinationEntry, body: string, routing: RoutingContext): void {
+  const platformId = dest.type === 'channel' ? dest.platformId! : dest.agentGroupId!;
+  const channelType = dest.type === 'channel' ? dest.channelType! : 'agent';
+  writeMessageOut({
+    id: generateId(),
+    in_reply_to: routing.inReplyTo,
+    kind: 'chat',
+    platform_id: platformId,
+    channel_type: channelType,
+    thread_id: null,
+    content: JSON.stringify({ text: body }),
+  });
 }
 
 function sleep(ms: number): Promise<void> {
