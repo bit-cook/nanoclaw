@@ -79,7 +79,7 @@ export interface ResourceDef {
    * wiring is added. The hook receives the same `values` object that was
    * inserted, so generated fields like `id` and `created_at` are populated.
    */
-  postCreate?: (row: Record<string, unknown>) => Promise<void> | void;
+  postCreate?: (row: Record<string, unknown>) => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -171,7 +171,7 @@ function genericCreate(def: ResourceDef) {
     getDb()
       .prepare(`INSERT INTO ${def.table} (${colNames.join(', ')}) VALUES (${placeholders.join(', ')})`)
       .run(values);
-    if (def.postCreate) await def.postCreate(values);
+    if (def.postCreate) def.postCreate(values);
     return values;
   };
 }
