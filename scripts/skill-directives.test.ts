@@ -8,7 +8,7 @@ const slack = readFileSync('.claude/skills/add-slack/SKILL.md', 'utf8');
 const directives = parseDirectives(slack);
 
 describe('skill-directives parser, on the converted add-slack', () => {
-  it('extracts every directive in document order — install, credentials, restart, resolve', () => {
+  it('extracts every directive in document order — install, credentials, resolve, restart', () => {
     expect(directives.map((d) => d.kind)).toEqual([
       'copy', // step 1: adapter + test from the channels branch
       'append', // step 2: barrel registration
@@ -21,10 +21,10 @@ describe('skill-directives parser, on the converted add-slack', () => {
       'env-set', // credentials: write captured values to .env
       'env-sync', // credentials: sync to container
       'operator', // credentials: event-delivery walkthrough
-      'run', // restart: load the adapter + creds, wait for the CLI socket
       'prompt', // resolve: owner member id (owner_handle)
-      'run', // resolve: validate token (auth.test)
+      'run', // resolve: validate token (auth.test) — fast-fail before the restart
       'run', // resolve: DM channel (conversations.open → capture:platform_id)
+      'run', // restart: load the adapter + creds once the credential is validated
     ]);
     // The wire (owner role, messaging-group, wiring, /welcome) is NOT in the
     // skill — it's the shared init-first-agent, called by the setup flow.
@@ -60,9 +60,9 @@ describe('skill-directives parser, on the converted add-slack', () => {
     expect(directives.filter((d) => d.kind === 'run').map((d) => d.attrs.effect)).toEqual([
       'build',
       'test',
-      'restart', // load adapter + creds before wiring
-      'fetch', // validate: auth.test
+      'fetch', // validate: auth.test — credential checked first
       'fetch', // resolve: conversations.open
+      'restart', // load adapter + creds after the credential is validated, before wiring
     ]);
   });
 

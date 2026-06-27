@@ -588,3 +588,97 @@ describe('nc:run effect:step (streaming, multi-field capture)', () => {
     expect(res.vars.platform_id).toBeUndefined();
   });
 });
+
+// Run-health gate: once any directive bounces (a real failure, not a deferred
+// prompt), the dangerous side effects — a live restart, an interactive
+// pairing/QR step, a wire — must not fire on their own. They bounce too, so the
+// agent finishes them from the prose after fixing the upstream failure. This is
+// what stops a doomed QR / a pointless restart after a bad credential.
+const GATE_SKILL = `# gate demo
+
+## Validate the credential first
+\`\`\`nc:run capture:who effect:fetch
+verify-cred
+\`\`\`
+
+## Restart the service
+\`\`\`nc:run effect:restart
+bash restart.sh
+\`\`\`
+
+## Link the device (interactive)
+\`\`\`nc:run effect:step capture:platform_id=PLATFORM_ID
+pnpm exec tsx setup/index.ts --step pair
+\`\`\`
+`;
+
+// A deferred prompt is NOT a failure: the headless rebuild leaves it (and its
+// {{var}} consumer) unresolved, but a later restart must still be runnable.
+const DEFER_THEN_RESTART_SKILL = `# defer then restart demo
+
+## Collect a token
+\`\`\`nc:prompt token secret
+Paste it.
+\`\`\`
+\`\`\`nc:env-set
+TOK={{token}}
+\`\`\`
+
+## Restart the service
+\`\`\`nc:run effect:restart
+bash restart.sh
+\`\`\`
+`;
+
+describe('run-health gate (a bounce blocks later side effects)', () => {
+  let groot: string;
+  let gskill: string;
+  beforeEach(() => {
+    gskill = mkdtempSync(join(tmpdir(), 'nc-gate-skill-'));
+    groot = mkdtempSync(join(tmpdir(), 'nc-gate-proj-'));
+    writeFileSync(join(groot, 'package.json'), '{"name":"scratch"}');
+    writeFileSync(join(groot, '.env'), '');
+  });
+
+  it('a failed effect:fetch blocks the later restart and step — they bounce, never execute', async () => {
+    writeFileSync(join(gskill, 'SKILL.md'), GATE_SKILL);
+    const cmds: string[] = [];
+    const streamed: string[] = [];
+    const exec = (c: string): string | void => {
+      cmds.push(c);
+      if (c === 'verify-cred') throw new Error('401 bad credential'); // bad cred → bounce
+    };
+    const execStream = async (c: string) => {
+      streamed.push(c);
+      return { ok: true, fields: { PLATFORM_ID: 'x' } };
+    };
+    const res = await applySkill(gskill, groot, { inputs: {}, exec, execStream });
+
+    // the fetch actually ran and threw — that's the first bounce
+    expect(cmds).toContain('verify-cred');
+    // the restart never executed (no live restart on a bad credential)…
+    expect(cmds).not.toContain('bash restart.sh');
+    // …and the interactive step never spawned (no doomed QR/pairing)
+    expect(streamed).toEqual([]);
+
+    // three agent tasks: the failed fetch + the two gated side effects
+    expect(res.agentTasks).toHaveLength(3);
+    const gated = res.agentTasks.filter((t) => /an earlier step did not complete/.test(t.reason));
+    expect(gated).toHaveLength(2); // restart + step, both bounced by the gate
+  });
+
+  it('a deferred prompt does NOT block a later restart (headless rebuild stays runnable)', async () => {
+    writeFileSync(join(gskill, 'SKILL.md'), DEFER_THEN_RESTART_SKILL);
+    const cmds: string[] = [];
+    const res = await applySkill(gskill, groot, { prompter: headless({}), exec: (c) => void cmds.push(c) });
+
+    // the prompt and its consumer deferred (no answer headless) — not a failure
+    expect(res.deferred).toContain('token');
+    expect(res.deferred.some((d) => /unresolved \{\{token\}\}/.test(d))).toBe(true);
+    expect(readFileSync(join(groot, '.env'), 'utf8')).not.toContain('TOK=');
+
+    // the restart still runs, and nothing bounced
+    expect(cmds).toContain('bash restart.sh');
+    expect(res.agentTasks).toEqual([]);
+  });
+});

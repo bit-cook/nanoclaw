@@ -441,7 +441,21 @@ export async function applySkill(skillDir: string, root: string, opts: ApplyOpti
   const resolveRemote = opts.resolveRemote ?? ((b: string) => defaultResolveRemote(b, root));
   const vars = new Map<string, { value: string; secret: boolean }>();
   const res: ApplyResult = { applied: [], skipped: [], deferred: [], agentTasks: [], operatorMessages: [], vars: {}, journal: [] };
-  const bounce = (d: Directive, reason: string) => res.agentTasks.push({ kind: d.kind, line: d.line, reason, prose: proseFor(md, d.line) });
+  // A run-health gate: once ANY directive bounces to an agent, the skill is no
+  // longer in a known-good state, so the dangerous side effects below must not
+  // fire on their own — a live restart, an interactive pairing/QR step, or a wire
+  // launched after an upstream failure just wastes the operator's time (a doomed
+  // QR, a restart that loads a bad credential). `blocked` latches on the first
+  // bounce; a later side-effecting run becomes its own bounce so the agent
+  // finishes it from the prose once the upstream failure is fixed. A DEFERRED
+  // prompt (headless rebuild, no answer) is not a failure — it never bounces, so
+  // `blocked` stays false and a later restart remains runnable.
+  let blocked = false;
+  const SIDE_EFFECTS = new Set(['restart', 'step', 'wire']);
+  const bounce = (d: Directive, reason: string) => {
+    blocked = true;
+    res.agentTasks.push({ kind: d.kind, line: d.line, reason, prose: proseFor(md, d.line) });
+  };
 
   for (const d of directives) {
     try {
@@ -479,6 +493,15 @@ export async function applySkill(skillDir: string, root: string, opts: ApplyOpti
       // A run whose effect the caller owns (e.g. restart) is skipped here.
       if (d.kind === 'run' && typeof d.attrs.effect === 'string' && opts.skipEffects?.includes(d.attrs.effect)) {
         res.skipped.push(`run ${d.attrs.effect}: owned by the caller`);
+        continue;
+      }
+      // Run-health gate: after an earlier bounce, never fire a dangerous side
+      // effect (a live restart, an interactive pairing/QR step, a wire) on its
+      // own — bounce it too so the agent runs it from the prose once the upstream
+      // failure is fixed. (A deferred prompt did NOT set `blocked`, so this only
+      // trips on a real failure, never a headless rebuild's missing input.)
+      if (d.kind === 'run' && typeof d.attrs.effect === 'string' && SIDE_EFFECTS.has(d.attrs.effect) && blocked) {
+        bounce(d, 'skipped: an earlier step did not complete — run this from the prose after fixing it');
         continue;
       }
       const st = selfStatus(d, root);

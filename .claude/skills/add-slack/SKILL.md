@@ -101,21 +101,13 @@ Set up event delivery (needs a public HTTPS URL for port 3000 — ngrok, a Cloud
 3. Interactivity & Shortcuts → toggle Interactivity on, set the same Request URL, Save Changes, then reinstall the app when Slack prompts.
 ```
 
-## Restart
-
-Restart the service so it loads the Slack adapter and the credentials you just
-stored, and wait for its CLI socket before wiring:
-
-```nc:run effect:restart
-bash setup/lib/restart.sh
-```
-
 ## Resolve your DM channel
 
 The agent talks to you in your direct-message channel with the bot. Resolve its
-address so the owner-wiring step can target it. You'll need your Slack member ID:
-open your profile (your avatar, bottom-left), then **⋮** → **Copy member ID** — it
-starts with `U`.
+address so the owner-wiring step can target it. Validating the token here, before
+the restart, fast-fails a bad credential while it's still cheap to fix. You'll
+need your Slack member ID: open your profile (your avatar, bottom-left), then
+**⋮** → **Copy member ID** — it starts with `U`.
 
 ```nc:prompt owner_handle validate:^U[A-Z0-9]{8,}$
 Your Slack member ID (Profile → ⋮ → "Copy member ID"; starts with U).
@@ -139,6 +131,15 @@ curl -s -X POST https://slack.com/api/conversations.open -H "Authorization: Bear
 `owner_handle` and `platform_id` are what the owner-wiring step needs. The
 greeting goes out over `chat.postMessage`, which works right away; to receive
 replies, finish the Event Subscriptions and Interactivity steps above.
+
+## Restart
+
+With the credential validated, restart the service so it loads the Slack adapter
+and the secrets you just stored, and wait for its CLI socket before wiring:
+
+```nc:run effect:restart
+bash setup/lib/restart.sh
+```
 
 ## Next Steps
 
