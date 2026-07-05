@@ -7,16 +7,16 @@
  *   - outline.png    — 32×32 transparent outline icon
  *   - color.png      — 192×192 full-color icon
  *
- * Icons are generated in-process using a minimal PNG encoder so we don't
- * need ImageMagick or vendor binary icon blobs into the repo. The outline
- * icon is a simple rounded square outline; the color icon is a brand-blue
- * filled square with a small white "N" blocked in by pixel setting. Good
- * enough for a working sideload — teams admins who care can replace the
- * icons later.
+ * Icons are generated in-process using a minimal PNG encoder, and the zip is
+ * written in-process too, so we need neither ImageMagick nor a `zip` binary
+ * on the host, nor vendored binary blobs in the repo. The outline icon is a
+ * simple rounded square outline; the color icon is a brand-blue filled
+ * square with a small white "N" blocked in by pixel setting. Good enough
+ * for a working sideload — teams admins who care can replace the icons
+ * later.
  *
  * The manifest is pinned to schema v1.16 to match the skill doc.
  */
-import { execSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import zlib from 'zlib';
@@ -36,6 +36,11 @@ export interface ManifestOptions {
   websiteUrl: string;
   /** Out-dir for the generated zip + loose files. */
   outDir: string;
+  /**
+   * Include RSC permissions (ChannelMessage.Read.Group, ChatMessage.Read.Chat)
+   * so the bot receives all channel/group-chat messages without @-mention.
+   */
+  rsc?: boolean;
 }
 
 export interface ManifestResult {
@@ -54,28 +59,93 @@ export function buildTeamsAppPackage(opts: ManifestOptions): ManifestResult {
   const colorPath = path.join(opts.outDir, 'color.png');
   const zipPath = path.join(opts.outDir, 'teams-app-package.zip');
 
-  fs.writeFileSync(manifestPath, renderManifest(opts));
-  fs.writeFileSync(outlinePath, encodeOutlineIcon());
-  fs.writeFileSync(colorPath, encodeColorIcon());
+  const manifest = Buffer.from(renderManifest(opts));
+  const outline = encodeOutlineIcon();
+  const color = encodeColorIcon();
 
-  // Fresh zip every run — idempotent, no stale files.
-  try {
-    fs.unlinkSync(zipPath);
-  } catch {
-    // noop if missing
-  }
-  execSync(`zip -j -q "${zipPath}" "${manifestPath}" "${outlinePath}" "${colorPath}"`, {
-    stdio: ['ignore', 'ignore', 'inherit'],
-  });
+  fs.writeFileSync(manifestPath, manifest);
+  fs.writeFileSync(outlinePath, outline);
+  fs.writeFileSync(colorPath, color);
+  fs.writeFileSync(
+    zipPath,
+    buildZip([
+      { name: 'manifest.json', data: manifest },
+      { name: 'outline.png', data: outline },
+      { name: 'color.png', data: color },
+    ]),
+  );
 
   return { zipPath, manifestPath, outlinePath, colorPath };
+}
+
+// ─── Minimal ZIP writer (no external deps, no `zip` binary) ───────────────
+//
+// Entries are stored uncompressed (method 0): the package is three tiny
+// files, and stored entries keep this trivially small and byte-deterministic
+// (fixed 1980-01-01 timestamp), which the test relies on.
+
+interface ZipEntry {
+  name: string;
+  data: Buffer;
+}
+
+// DOS-format date for 1980-01-01: bits 15–9 year-1980, 8–5 month, 4–0 day.
+const ZIP_DOS_DATE = (1 << 5) | 1;
+
+function buildZip(entries: ZipEntry[]): Buffer {
+  const locals: Buffer[] = [];
+  const centrals: Buffer[] = [];
+  let offset = 0;
+
+  for (const { name, data } of entries) {
+    const nameBuf = Buffer.from(name, 'ascii');
+    const crc = crc32(data);
+
+    const local = Buffer.alloc(30);
+    local.writeUInt32LE(0x04034b50, 0); // local file header signature
+    local.writeUInt16LE(20, 4); // version needed to extract (2.0)
+    local.writeUInt16LE(0, 8); // compression method: stored
+    local.writeUInt16LE(ZIP_DOS_DATE, 12);
+    local.writeUInt32LE(crc, 14);
+    local.writeUInt32LE(data.length, 18); // compressed size
+    local.writeUInt32LE(data.length, 22); // uncompressed size
+    local.writeUInt16LE(nameBuf.length, 26);
+    locals.push(local, nameBuf, data);
+
+    const central = Buffer.alloc(46);
+    central.writeUInt32LE(0x02014b50, 0); // central directory header signature
+    central.writeUInt16LE(20, 4); // version made by
+    central.writeUInt16LE(20, 6); // version needed to extract
+    central.writeUInt16LE(0, 10); // compression method: stored
+    central.writeUInt16LE(ZIP_DOS_DATE, 14);
+    central.writeUInt32LE(crc, 16);
+    central.writeUInt32LE(data.length, 20); // compressed size
+    central.writeUInt32LE(data.length, 24); // uncompressed size
+    central.writeUInt16LE(nameBuf.length, 28);
+    central.writeUInt32LE(offset, 42); // offset of local header
+    centrals.push(central, nameBuf);
+
+    offset += 30 + nameBuf.length + data.length;
+  }
+
+  const centralDir = Buffer.concat(centrals);
+  const eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054b50, 0); // end-of-central-directory signature
+  eocd.writeUInt16LE(entries.length, 8); // entries on this disk
+  eocd.writeUInt16LE(entries.length, 10); // entries total
+  eocd.writeUInt32LE(centralDir.length, 12);
+  eocd.writeUInt32LE(offset, 16); // central directory offset
+
+  return Buffer.concat([...locals, centralDir, eocd]);
 }
 
 function renderManifest(opts: ManifestOptions): string {
   const manifest = {
     $schema: MANIFEST_SCHEMA,
     manifestVersion: MANIFEST_VERSION,
-    version: '1.0.0',
+    // Teams app-update flows want a higher version than the already-uploaded
+    // package, so the RSC variant (typically a re-upload) bumps it.
+    version: opts.rsc ? '1.1.0' : '1.0.0',
     id: opts.appId,
     packageName: 'com.nanoclaw.bot',
     developer: {
@@ -104,6 +174,21 @@ function renderManifest(opts: ManifestOptions): string {
     ],
     permissions: ['identity', 'messageTeamMembers'],
     validDomains: [new URL(opts.websiteUrl).host],
+    ...(opts.rsc && {
+      // RSC grants bind to webApplicationInfo.id, not bots[].botId — without
+      // this block the permissions are never attached to the app and the bot
+      // silently keeps requiring @-mention. `resource` must be non-empty but
+      // its value is unused for RSC-only apps.
+      webApplicationInfo: { id: opts.appId, resource: 'https://notapplicable' },
+      authorization: {
+        permissions: {
+          resourceSpecific: [
+            { name: 'ChannelMessage.Read.Group', type: 'Application' },
+            { name: 'ChatMessage.Read.Chat', type: 'Application' },
+          ],
+        },
+      },
+    }),
   };
   return JSON.stringify(manifest, null, 2) + '\n';
 }
@@ -269,3 +354,4 @@ function setWhite(pixels: Uint8Array, size: number, x: number, y: number): void 
   pixels[i + 2] = 255;
   pixels[i + 3] = 255;
 }
+
