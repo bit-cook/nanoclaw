@@ -124,8 +124,8 @@ describe('runChannelSkill adapter (Option A)', () => {
 
     // the adapter install ran, but no bot was created and no login step fired…
     expect(log.some((c) => c.includes('pnpm add @chat-adapter/teams'))).toBe(true);
-    expect(log.some((c) => c.includes('teams app create'))).toBe(false);
-    expect(log.some((c) => c.includes('teams login'))).toBe(false);
+    expect(log.some((c) => c.includes('app create'))).toBe(false);
+    expect(log.some((c) => c.includes('login'))).toBe(false);
     // …the Teams CLI install is also skipped (nothing to create)…
     expect(log.some((c) => c.includes('npm install -g @microsoft/teams.cli'))).toBe(false);
     // …the service still restarts (adapter + existing credentials load)…
@@ -189,7 +189,7 @@ describe('runChannelSkill adapter (Option A)', () => {
       exec: (c) => {
         log.push(`exec:${c}`);
         if (c.includes('TEAMS_APP_ID=.')) return 'no'; // the have_creds probe: nothing configured yet
-        if (c.includes('teams app create')) {
+        if (c.includes(' app create ')) {
           // the --json shape teams.cli@3.0.2 prints (credentials keys are UPPERCASE)
           return JSON.stringify({
             appName: 'NanoClaw',
@@ -221,9 +221,10 @@ describe('runChannelSkill adapter (Option A)', () => {
     // the CLI installed globally (npm runs keytar's install script; pnpm's
     // build-script policy would leave the credential store unbuildable)…
     expect(log.some((c) => c.includes('npm install -g @microsoft/teams.cli@3.0.2'))).toBe(true);
-    // …the login ran as a streaming step, never a plain exec…
-    expect(steps.some((c) => c.includes('teams login'))).toBe(true);
-    expect(log.some((c) => c.startsWith('exec:') && c.includes('teams login'))).toBe(false);
+    // …the login ran as a streaming step, never a plain exec (the CLI is
+    // invoked by absolute path — $(npm prefix -g)/bin/teams — so match loosely)…
+    expect(steps.some((c) => c.includes('/bin/teams" login'))).toBe(true);
+    expect(log.some((c) => c.startsWith('exec:') && c.includes(' login'))).toBe(false);
     // …create got the collected public URL on the real /webhook/teams route…
     expect(log.some((c) => c.includes('--endpoint "https://acme.example/webhook/teams"'))).toBe(true);
     // …the captured credentials landed in .env with the safe SingleTenant pairing…

@@ -125,6 +125,11 @@ nvm, or `npm config set prefix ~/.npm-global`.)
 npm install -g @microsoft/teams.cli@3.0.2
 ```
 
+npm's global bin directory is not reliably on PATH (custom prefixes rarely
+are), so every step below calls the CLI by its absolute path,
+`$(npm prefix -g)/bin/teams`. Where this document says to run `teams …` by
+hand, use that path too if plain `teams` isn't found.
+
 ### Sign in to Microsoft 365
 
 Every `teams` command is a separate process, so the sign-in must survive into
@@ -140,7 +145,7 @@ run `teams login` then `teams status` by hand: status must say logged in, or
 the cache is not persisting (see Troubleshooting).
 
 ```nc:run effect:step when:have_creds=no
-teams login && teams status --json 2>/dev/null | grep -q '"loggedIn": true' && printf '=== NANOCLAW SETUP: TEAMS-LOGIN ===\nSTATUS: success\n=== END ===\n'
+"$(npm prefix -g)/bin/teams" login && "$(npm prefix -g)/bin/teams" status --json 2>/dev/null | grep -q '"loggedIn": true' && printf '=== NANOCLAW SETUP: TEAMS-LOGIN ===\nSTATUS: success\n=== END ===\n'
 ```
 
 ### Create the bot
@@ -155,7 +160,7 @@ self-hosted assistant; for a bot other Microsoft 365 tenants can install, see
 bot name in Teams.
 
 ```nc:run effect:external when:have_creds=no capture:app_id=.credentials.CLIENT_ID,app_password=.credentials.CLIENT_SECRET,app_tenant_id=.credentials.TENANT_ID,teams_app_id=.teamsAppId,install_link=.installLink validate:^.+$
-teams app create --name "NanoClaw" --endpoint "{{public_url}}/webhook/teams" --sign-in-audience myOrg --json
+"$(npm prefix -g)/bin/teams" app create --name "NanoClaw" --endpoint "{{public_url}}/webhook/teams" --sign-in-audience myOrg --json
 ```
 
 ### Store the credentials
@@ -337,6 +342,14 @@ and user level; the login output prints the same check.
 
 Free personal Teams does not support sideloading at all — use a Microsoft 365
 Business / EDU / developer tenant.
+
+### `teams: command not found`
+
+The CLI installed fine but npm's global bin directory isn't on your PATH — a
+common state with custom npm prefixes. Find it with `npm prefix -g` (the
+binary is at `<prefix>/bin/teams`), then either add that directory to PATH or
+symlink the binary somewhere already on it. The skill's own steps are immune —
+they invoke the absolute path.
 
 ### Create fails immediately with `AUTH_REQUIRED` after a successful sign-in
 
