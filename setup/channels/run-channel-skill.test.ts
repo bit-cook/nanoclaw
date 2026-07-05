@@ -1,9 +1,13 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { execSync } from 'node:child_process';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { runChannelSkill } from './run-channel-skill.js';
+import { runSkill } from '../lib/skill-driver.js';
+import { fullyApplied } from '../../scripts/skill-apply.js';
+import { parseDirectives } from '../../scripts/skill-directives.js';
 import { BACK_TO_CHANNEL_SELECTION, backGate } from '../lib/back-nav.js';
 
 // Drive the first-prompt back gate (back-nav's brightSelect) from a queue
@@ -73,25 +77,27 @@ describe('runChannelSkill adapter (Option A)', () => {
 
   // Teams' platform_id only exists after the first inbound, so its SKILL.md
   // installs + hands off and runChannelSkill is called with deferWire — it must
-  // run the skill but never reach the shared wire. This is the driver-policy
-  // parity fixture: it runs the DEFAULT onEvent handler (never an injected
-  // onEvent, which would replace the policy — §5.0) and injects the
-  // confirm/openUrl seams to prove both natural barriers fire and the portal
-  // URL offer survives from the operator prose alone.
-  it('deferWire (Teams): default policy fires the gate barriers + portal URL offer, never reaches the shared wire', async () => {
+  // run the skill but never reach the shared wire. The credentials flow is
+  // CLI-first and guarded by the have_creds probe: this fixture answers the
+  // probe with "yes" (credentials already in .env), so every creation step —
+  // the teams-login step, teams app create, the env writes, the install-link
+  // operator — is when:-skipped and the run drops straight through to restart.
+  it('deferWire (Teams): existing credentials skip the whole CLI create flow, never reach the shared wire', async () => {
     const root = mkdtempSync(join(tmpdir(), 'rcs-teams-'));
     mkdirSync(join(root, 'src/channels'), { recursive: true });
     writeFileSync(join(root, 'src/channels/index.ts'), '// barrel\n');
-    writeFileSync(join(root, '.env'), '');
+    writeFileSync(join(root, '.env'), 'TEAMS_APP_ID=existing\nTEAMS_APP_PASSWORD=existing-password\n');
     writeFileSync(join(root, 'package.json'), '{"name":"scratch"}');
 
     const log: string[] = [];
-    const opened: string[] = [];
     const wired: unknown[] = [];
 
     await runChannelSkill('teams', 'Acme Corp', {
       projectRoot: root,
-      exec: (c) => void log.push(`exec:${c}`),
+      exec: (c) => {
+        log.push(`exec:${c}`);
+        if (c.includes('TEAMS_APP_ID=.')) return 'yes'; // the have_creds probe
+      },
       resolveRemote: () => 'origin',
       reuse: false,
       deferWire: true,
@@ -102,13 +108,13 @@ describe('runChannelSkill adapter (Option A)', () => {
         log.push(`confirm:${m}`);
         return true;
       },
-      openUrl: async (u) => void opened.push(u),
-      // a MultiTenant app, so the SingleTenant-guarded app_tenant_id prompt is skipped
-      inputs: {
-        public_url: 'https://acme.example',
-        app_id: '12345678-1234-1234-1234-123456789abc',
-        app_type: 'MultiTenant',
-        app_password: 'a-much-longer-app-password', // 20+ chars — valid for the declared shape
+      openUrl: async () => undefined,
+      // NO inputs: the public_url prompt is when:have_creds=no-guarded, so the
+      // drop-through path must never ask for it. If the guard regressed, the
+      // prompt would defer (resolveInput undefined) and fail() would be called.
+      resolveInput: async () => undefined,
+      fail: async (step, msg) => {
+        throw new Error(`fail() called on drop-through path: ${step} — ${msg}`);
       },
       wire: (a) => {
         wired.push(a);
@@ -116,19 +122,125 @@ describe('runChannelSkill adapter (Option A)', () => {
       },
     });
 
-    // install + manifest ran…
-    expect(log.some((c) => c.includes('teams-manifest-build'))).toBe(true);
-    // …the Azure portal offer came from the operator BODY text (policy §5.2)…
-    expect(opened.some((u) => /portal\.azure\.com/.test(u))).toBe(true);
-    // …a natural-barrier confirm (not a URL offer) fired BEFORE the manifest
-    // build (the manifest-before-the-app hazard fix, now derived from document
-    // structure instead of an authored gate attr)…
-    const firstGate = log.findIndex((c) => c.startsWith('confirm:') && !c.startsWith('confirm:Open '));
-    const manifestAt = log.findIndex((c) => c.includes('teams-manifest-build'));
-    expect(firstGate).toBeGreaterThanOrEqual(0);
-    expect(firstGate).toBeLessThan(manifestAt);
-    // …but the shared wire was never reached (no owner_handle/platform_id needed)
+    // the adapter install ran, but no bot was created and no login step fired…
+    expect(log.some((c) => c.includes('pnpm add @chat-adapter/teams'))).toBe(true);
+    expect(log.some((c) => c.includes('teams app create'))).toBe(false);
+    expect(log.some((c) => c.includes('teams login'))).toBe(false);
+    // …the Teams CLI install is also skipped (nothing to create)…
+    expect(log.some((c) => c.includes('pnpm add @microsoft/teams.cli'))).toBe(false);
+    // …the service still restarts (adapter + existing credentials load)…
+    expect(log.some((c) => c.includes('restart.sh'))).toBe(true);
+    // …the pre-existing .env values were left alone…
+    expect(readFileSync(join(root, '.env'), 'utf8')).toContain('TEAMS_APP_ID=existing');
+    // …and the shared wire was never reached (no owner_handle/platform_id needed)
     expect(wired).toHaveLength(0);
+  });
+
+  // The probe's shell one-liner is dispatched by substring in the fixtures
+  // above — its actual semantics (EITHER key present ⇒ yes; a partial pair
+  // must NOT trigger a second `teams app create`) are asserted here by running
+  // the REAL command from the REAL SKILL.md against real .env states. Parsed
+  // from the document so the test can't drift from what ships.
+  it('Teams have_creds probe: either credential key present answers yes', () => {
+    const md = readFileSync(join(process.cwd(), '.claude/skills/add-teams/SKILL.md'), 'utf8');
+    const probe = parseDirectives(md).find(
+      (d) => d.kind === 'run' && d.attrs.capture === 'have_creds',
+    );
+    expect(probe).toBeDefined();
+    const cmd = probe!.body.join('\n');
+
+    const cases: Array<[string | null, string]> = [
+      ['TEAMS_APP_ID=a\nTEAMS_APP_PASSWORD=b\n', 'yes'],
+      ['TEAMS_APP_ID=a\n', 'yes'], // partial pair: creating another app would corrupt it
+      ['TEAMS_APP_PASSWORD=b\n', 'yes'],
+      ['OTHER=x\n', 'no'],
+      ['TEAMS_APP_ID=\n', 'no'], // empty value counts as unset (mirrors env-set)
+      [null, 'no'], // no .env at all
+    ];
+    for (const [env, expected] of cases) {
+      const dir = mkdtempSync(join(tmpdir(), 'rcs-probe-'));
+      if (env !== null) writeFileSync(join(dir, '.env'), env);
+      const out = execSync(cmd, { cwd: dir, shell: '/bin/bash', encoding: 'utf8' }).trim();
+      expect(out, `env=${JSON.stringify(env)}`).toBe(expected);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // The fresh-create leg of the same document, driven at the runSkill level so
+  // the effect:step gets an injected streaming exec (runChannelSkill exposes no
+  // execStream seam — CI must never spawn a real `teams login`). Proves the
+  // CLI-first chain end-to-end: login step → create's JSON multi-capture → the
+  // env writes → the substituted install link surviving into the URL offer.
+  it('Teams fresh create: login step + JSON capture drive the env writes and the install-link offer', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'rcs-teams-create-'));
+    mkdirSync(join(root, 'src/channels'), { recursive: true });
+    writeFileSync(join(root, 'src/channels/index.ts'), '// barrel\n');
+    writeFileSync(join(root, '.env'), '');
+    writeFileSync(join(root, 'package.json'), '{"name":"scratch"}');
+
+    const INSTALL_LINK =
+      'https://teams.microsoft.com/l/app/tapp-123?installAppPackage=true&appTenantId=tenant-1';
+    const log: string[] = [];
+    const opened: string[] = [];
+    const steps: string[] = [];
+
+    const res = await runSkill('.claude/skills/add-teams', {
+      projectRoot: root,
+      exec: (c) => {
+        log.push(`exec:${c}`);
+        if (c.includes('TEAMS_APP_ID=.')) return 'no'; // the have_creds probe: nothing configured yet
+        if (c.includes('teams app create')) {
+          // the --json shape teams.cli@3.0.2 prints (credentials keys are UPPERCASE)
+          return JSON.stringify({
+            appName: 'NanoClaw',
+            teamsAppId: 'tapp-123',
+            botId: '12345678-1234-1234-1234-123456789abc',
+            installLink: INSTALL_LINK,
+            portalLink: 'https://dev.teams.microsoft.com/apps/tapp-123',
+            credentials: {
+              CLIENT_ID: '12345678-1234-1234-1234-123456789abc',
+              CLIENT_SECRET: 'a-much-longer-app-secret',
+              TENANT_ID: '87654321-4321-4321-4321-cba987654321',
+            },
+          });
+        }
+      },
+      execStream: async (cmd) => {
+        steps.push(cmd);
+        return { ok: true, fields: { STATUS: 'success' } };
+      },
+      resolveRemote: () => 'origin',
+      inputs: { public_url: 'https://acme.example' },
+      confirm: async (m) => {
+        log.push(`confirm:${m}`);
+        return true;
+      },
+      openUrl: async (u) => void opened.push(u),
+    });
+
+    // the login ran as a streaming step, never a plain exec…
+    expect(steps.some((c) => c.includes('teams login'))).toBe(true);
+    expect(log.some((c) => c.startsWith('exec:') && c.includes('teams login'))).toBe(false);
+    // …create got the collected public URL on the real /webhook/teams route…
+    expect(log.some((c) => c.includes('--endpoint "https://acme.example/webhook/teams"'))).toBe(true);
+    // …the captured credentials landed in .env with the safe SingleTenant pairing…
+    const env = readFileSync(join(root, '.env'), 'utf8');
+    expect(env).toContain('TEAMS_APP_ID=12345678-1234-1234-1234-123456789abc');
+    expect(env).toContain('TEAMS_APP_PASSWORD=a-much-longer-app-secret');
+    expect(env).toContain('TEAMS_APP_TENANT_ID=87654321-4321-4321-4321-cba987654321');
+    expect(env).toContain('TEAMS_APP_TYPE=SingleTenant');
+    // …the install-link operator offered the SUBSTITUTED link (policy §5.2 runs on
+    // the rendered body — an unsubstituted {{var}} would have been excluded)…
+    expect(opened).toContain(INSTALL_LINK);
+    // …a natural-barrier confirm fired between the install operator and restart…
+    const gateAt = log.findIndex((c) => c.startsWith('confirm:') && !c.startsWith('confirm:Open '));
+    const restartAt = log.findIndex((c) => c.includes('restart.sh'));
+    expect(gateAt).toBeGreaterThanOrEqual(0);
+    expect(gateAt).toBeLessThan(restartAt);
+    // …and the whole document applied with nothing deferred or bounced.
+    expect(res.deferred).toEqual([]);
+    expect(res.agentTasks).toEqual([]);
+    expect(fullyApplied(res)).toBe(true);
   });
 
   // The engine reads `.claude/skills/add-<channel>/SKILL.md` relative to cwd (the

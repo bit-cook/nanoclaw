@@ -73,8 +73,8 @@ export const STEP_FILES: Record<string, string[]> = {
   'slack-validate': ['setup/channels/slack.ts'],
   'imessage-install': ['.claude/skills/add-imessage/SKILL.md', 'scripts/skill-apply.ts', 'setup/channels/imessage.ts'],
   'imessage': ['setup/channels/imessage.ts'],
-  'teams-install': ['.claude/skills/add-teams/SKILL.md', 'scripts/skill-apply.ts', 'setup/channels/teams.ts'],
-  'teams-manifest': ['setup/lib/teams-manifest.ts', 'setup/channels/teams.ts'],
+  'teams-install': ['.claude/skills/add-teams/SKILL.md', 'scripts/skill-apply.ts', 'setup/channels/run-channel-skill.ts'],
+  'teams-manifest': ['setup/lib/teams-manifest.ts', 'setup/channels/teams-manifest-build.ts'],
   'init-first-agent': [
     'scripts/init-first-agent.ts',
     'setup/channels/telegram.ts',

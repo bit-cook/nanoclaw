@@ -28,24 +28,18 @@ function operatorBody(md: string, n: number): string {
 }
 
 describe('gatePolicy — §5.1 parity table (real skills)', () => {
-  it('teams: exactly the two authored gates — and NO confirm on the operator-chain head', () => {
-    // Operators in order: prerequisites, portal app, client secret, bot resource
-    // (chain head), enable-channel (chain tail), sideload, final handoff.
+  it('teams: one gate — the install-in-Teams operator pauses before the restart', () => {
+    // Operators in order (CLI-first flow): prerequisites, install-in-Teams
+    // (when:have_creds=no), final handoff.
     const d = decisions(loadSkill('teams'));
-    expect(d).toHaveLength(7);
+    expect(d).toHaveLength(3);
     expect(d.map((g) => g.needsConfirm)).toEqual([
-      false, // → prompt public_url (prompt is the barrier)
-      false, // → prompt app_id
-      false, // → prompt app_password
-      false, // bot-resource block → next compatible is another OPERATOR (rule 2):
-      //        the chain's LAST operator carries the barrier — never double-confirm
-      true, //  enable-channel → run effect:check (the manifest hazard gate)
-      true, //  sideload → run effect:restart
+      false, // prereqs → prompt public_url (prompt is the barrier)
+      true, //  install-in-Teams → run effect:restart
       false, // final handoff → end of document
     ]);
-    // Both confirms are completed-work flavor (check/restart, not effect:step).
-    expect(d[4].flavor).toBe('completed');
-    expect(d[5].flavor).toBe('completed');
+    // Completed-work flavor (restart, not effect:step).
+    expect(d[1].flavor).toBe('completed');
   });
 
   it('telegram: the pairing operator gains a readiness pause before the effect:step', () => {
@@ -140,10 +134,15 @@ describe('gatePolicy — rules on synthetic fixtures', () => {
 // §5.2 URL-offer inventory — every operator body in the tree, plus the
 // normative negative fixture (slack's placeholder URL).
 describe('extractOfferUrl — §5.2 inventory', () => {
-  it('teams: both portal blocks offer a clean https://portal.azure.com (trailing comma stripped)', () => {
+  it('teams: raw bodies stay offer-free — the install link is a {{var}} until substitution', () => {
     const md = loadSkill('teams');
-    expect(extractOfferUrl(operatorBody(md, 1))).toBe('https://portal.azure.com'); // app registration
-    expect(extractOfferUrl(operatorBody(md, 3))).toBe('https://portal.azure.com'); // bot resource (new offer)
+    // The install block's URL is {{install_link}} in the AUTHORED body — no
+    // candidate matches here; the offer materializes at runtime from the
+    // rendered body (proven in run-channel-skill.test.ts's fresh-create case).
+    expect(operatorBody(md, 1)).toContain('{{install_link}}');
+    expect(extractOfferUrl(operatorBody(md, 0))).toBeUndefined(); // prereqs
+    expect(extractOfferUrl(operatorBody(md, 1))).toBeUndefined(); // install-in-Teams
+    expect(extractOfferUrl(operatorBody(md, 2))).toBeUndefined(); // final handoff
   });
 
   it('slack — the <your-public-host> placeholder is EXCLUDED (normative negative fixture)', () => {

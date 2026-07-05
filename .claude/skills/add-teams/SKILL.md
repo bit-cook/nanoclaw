@@ -14,11 +14,14 @@ reads the prose and applies them, and a parser can apply them deterministically
 from the same document. Every directive is idempotent, so the whole skill is
 safe to re-run; anything a parser can't apply falls back to the prose beside it.
 
-Teams is the most involved channel NanoClaw supports — there's no "paste a
-token" shortcut. You'll walk through about seven Azure portal steps (app
-registration, client secret, Azure Bot resource, messaging endpoint, Teams
-channel, app package, sideload). Take them one at a time; the prompts below
-collect each value as you produce it.
+Teams has no "paste a token" shortcut — a bot has to exist in Microsoft's cloud
+before it can receive a message. The Microsoft Teams CLI collapses that into
+one sign-in and one create command: it registers the Entra app, generates the
+client secret, registers a Teams-managed bot (through the Teams Developer
+Portal — **no Azure subscription needed**), uploads the app package, and hands
+back an install link. The old ~7-step Azure portal walk survives only as a
+fallback in [Alternatives](#alternatives) for tenants where the Developer
+Portal is blocked.
 
 ## Apply
 
@@ -71,139 +74,106 @@ runs.
 ## Credentials
 
 The adapter is installed and registered, but it can't receive a message until a
-bot exists in Azure, points at this machine, and is sideloaded into Teams. None
-of those steps can be clicked through by a parser, so they're operator
-instructions — relay each one, then collect the value it produces.
+bot exists, points at this machine, and is installed into Teams. The Teams CLI
+does all of that below.
 
-Before you start, tell the user:
+### Check for existing credentials
 
-```nc:operator
+Re-running `teams app create` provisions a brand-new app registration and bot
+each time — it never reuses the first one. So the flow starts with a probe:
+when `.env` already carries a Teams credential — either key; a partial pair
+means a half-finished setup that creating ANOTHER app would only corrupt —
+every step below (prompts included) is skipped and the flow drops straight
+through to [Restart](#restart). To rotate credentials or finish a partial
+configuration, see [Troubleshooting](#troubleshooting); if your tunnel URL
+changed, the fix is `teams app update`, not a re-run (also in Troubleshooting).
+
+```nc:run capture:have_creds
+( grep -q '^TEAMS_APP_ID=.' .env 2>/dev/null || grep -q '^TEAMS_APP_PASSWORD=.' .env 2>/dev/null ) && echo yes || echo no
+```
+
+Before creating anything, tell the user:
+
+```nc:operator when:have_creds=no
 Confirm you have everything Teams setup needs:
-1. A Microsoft 365 tenant where you can sideload custom apps — free personal Teams does NOT support this; you need a Microsoft 365 Business / EDU / developer tenant with Teams admin or developer rights.
-2. A way to expose an HTTPS endpoint from this machine (ngrok, a Cloudflare Tunnel, or a reverse-proxied VPS). Azure Bot Service delivers activities to it.
+1. A Microsoft 365 account that can create Entra app registrations and upload custom apps (sideloading) — free personal Teams does NOT qualify; you need a Microsoft 365 Business / EDU / developer tenant.
+2. A way to expose an HTTPS endpoint that forwards to this machine's webhook port 3000 (ngrok, a Cloudflare Tunnel, or a reverse-proxied VPS). Start it now if it isn't running — e.g. `ngrok http 3000` — the create step needs the URL up front.
 ```
 
 ### Public URL
 
-Azure Bot Service delivers messages to an HTTPS endpoint you control; it has to
-reach this machine's webhook server (port 3000) at `/api/webhooks/teams`. If you
-don't have a tunnel running yet, start one in another terminal first — e.g.
-`ngrok http 3000` gives you `https://abcd1234.ngrok.io`.
+Microsoft delivers bot messages to an HTTPS endpoint you control; it has to
+reach this machine's webhook server (port 3000, configurable via
+`WEBHOOK_PORT`) at `/webhook/teams`.
 
-```nc:prompt public_url validate:^https:// normalize:rstrip-slash
-Paste your public base URL (https://…, no trailing path) — e.g. https://abcd1234.ngrok.io.
+```nc:prompt public_url when:have_creds=no validate:^https:// normalize:rstrip-slash
+Paste the public https:// base URL that forwards to this machine's port 3000 (no trailing path) — e.g. https://abcd1234.ngrok.io from `ngrok http 3000`.
 ```
 
-### Register the Azure app
+### Install the Teams CLI
 
-Tell the user:
+Pinned like every dependency; the CLI is only exercised at setup time but stays
+useful for later maintenance (endpoint updates, RSC grants, secret rotation).
 
-```nc:operator
-Create the Azure AD app registration:
-1. In https://portal.azure.com, search "App registrations" → "New registration".
-2. Name it (e.g. "NanoClaw").
-3. Supported account types: Single tenant (your org only — most common for self-host) OR Multi tenant (any Microsoft 365 tenant can add the bot).
-4. Click Register.
-5. On the Overview page, copy the Application (client) ID and, for a single-tenant app, the Directory (tenant) ID.
+```nc:dep when:have_creds=no
+@microsoft/teams.cli@3.0.2
 ```
 
-```nc:prompt app_id validate:^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$
-Paste the Application (client) ID — App registration Overview page.
-```
-```nc:prompt app_type validate:^(SingleTenant|MultiTenant)$
-Enter the app type — `SingleTenant` or `MultiTenant` (must match the account type you picked).
-```
-```nc:prompt app_tenant_id when:app_type=SingleTenant validate:^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$
-Paste the Directory (tenant) ID — App registration Overview page (Single Tenant only).
-```
+### Sign in to Microsoft 365
 
-### Create a client secret
+The sign-in is cached locally and persists across CLI invocations, so this is
+safe to re-run. In an interactive terminal it opens a browser sign-in; on a
+headless box (SSH) it automatically falls back to printing a device code —
+open microsoft.com/devicelogin on any machine and enter it. If this step
+fails, run `pnpm exec teams login` by hand and watch its output, then re-run
+the skill.
 
-Tell the user:
-
-```nc:operator
-Create the client secret:
-1. In your app registration, open "Certificates & secrets".
-2. Click "New client secret" — Description "nanoclaw", Expires 180 days (recommended) or longer.
-3. Click Add.
-4. COPY THE VALUE NOW — Azure only shows it once (the Value column, not the Secret ID).
+```nc:run effect:step when:have_creds=no
+pnpm exec teams login && printf '=== NANOCLAW SETUP: TEAMS-LOGIN ===\nSTATUS: success\n=== END ===\n'
 ```
 
-```nc:prompt app_password secret validate:^.{20,}$
-Paste the client secret Value — Certificates & secrets (shown only once, at least 20 characters).
+### Create the bot
+
+One command registers the Entra app, generates a client secret (Graph can take
+~30s to see the new app — the CLI retries), registers a Teams-managed bot, and
+uploads the app package to the Teams Developer Portal. It needs the sign-in
+from the previous step (`AUTH_REQUIRED` means run that first). The bot is
+created single-tenant (`--sign-in-audience myOrg`) — the safe default for a
+self-hosted assistant; for a bot other Microsoft 365 tenants can install, see
+[Alternatives](#alternatives). Change `--name` first if you want a different
+bot name in Teams.
+
+```nc:run effect:external when:have_creds=no capture:app_id=.credentials.CLIENT_ID,app_password=.credentials.CLIENT_SECRET,app_tenant_id=.credentials.TENANT_ID,teams_app_id=.teamsAppId,install_link=.installLink validate:^.+$
+pnpm exec teams app create --name "NanoClaw" --endpoint "{{public_url}}/webhook/teams" --sign-in-audience myOrg --json
 ```
 
 ### Store the credentials
 
-The adapter reads these from `.env` (set-if-absent, so a value you've already
-filled in is never overwritten).
-`TEAMS_APP_TENANT_ID` is written only for a Single Tenant app; Multi Tenant
-doesn't need it.
+The adapter reads these from `.env` (set-if-absent — a value you've already
+filled in is never overwritten). The pairing matters: `SingleTenant` requires
+`TEAMS_APP_TENANT_ID`, and a multi-tenant app must instead set
+`TEAMS_APP_TYPE=MultiTenant` with **no** tenant ID — a mismatch makes the
+adapter authenticate against the wrong authority and every message fails with
+a 401 from Bot Framework.
 
-```nc:env-set
+```nc:env-set when:have_creds=no
 TEAMS_APP_ID={{app_id}}
 TEAMS_APP_PASSWORD={{app_password}}
-TEAMS_APP_TYPE={{app_type}}
-```
-```nc:env-set when:app_type=SingleTenant
 TEAMS_APP_TENANT_ID={{app_tenant_id}}
+TEAMS_APP_TYPE=SingleTenant
 ```
-### Create the Azure Bot resource
 
+### Install the app in Teams
+
+The app package is already uploaded — no manifest zip, no manual sideload.
 Tell the user:
 
-```nc:operator
-Create the Azure Bot resource and point it at this machine:
-1. In https://portal.azure.com, search "Azure Bot" → Create.
-2. Bot handle: a unique name, e.g. nanoclaw-bot.
-3. Type of App: {{app_type}} — Creation type: Use existing app registration.
-4. App ID: {{app_id}}.
-5. After creating, open the bot → Configuration and set Messaging endpoint to {{public_url}}/api/webhooks/teams, then Apply.
-```
-
-### Enable the Teams channel
-
-Tell the user (finish every Azure step above before continuing — the package
-built next bakes in the app registration, so the Azure app and bot must already
-exist):
-
-```nc:operator
-Enable the Microsoft Teams channel on the bot:
-1. Open your Azure Bot resource → Channels.
-2. Click Microsoft Teams → Accept terms → Apply.
-When the Azure app, bot resource, and Teams channel are all in place, continue.
-```
-
-### Build the Teams app package
-
-The manifest bakes in the Application (client) ID, so the Azure app registration
-above must be done first — building with a blank `app_id` produces a package that
-no bot can claim. Confirm it's set before generating the zip:
-
-```nc:run effect:check
-[ -n "{{app_id}}" ]
-```
-
-Generate the zip you'll sideload into Teams (manifest + icons, written to
-`data/teams/teams-app-package.zip`). Re-running regenerates a fresh zip, so this
-is safe to repeat.
-
-```nc:run effect:external
-pnpm exec tsx setup/channels/teams-manifest-build.ts --app-id "{{app_id}}" --url "{{public_url}}"
-```
-
-### Sideload the app into Teams
-
-Tell the user (do this before the restart below — the service should come up with
-the app already sideloaded):
-
-```nc:operator
-Sideload the generated app package into Teams:
-1. Open Microsoft Teams → Apps → Manage your apps → Upload an app.
-2. Click "Upload a custom app" (or "Upload for me or my teams").
-3. Select data/teams/teams-app-package.zip and click Add.
-4. If "Upload a custom app" is missing, your tenant admin has disabled sideloading — enable it in Teams Admin Center → Teams apps → Setup policies → Global → Upload custom apps = On.
-Once the app is added in Teams, continue.
+```nc:operator when:have_creds=no
+Install the bot into Teams:
+1. Open {{install_link}} — Teams opens with the app's install dialog. Click Add.
+2. If you need the link again later, run: pnpm exec teams app get {{teams_app_id}} --install-link
+3. If Teams refuses with a custom-app-upload error, a tenant admin must enable sideloading: Teams Admin Center > Teams apps > Setup policies > Global > "Upload custom apps" = On.
+Once the app shows up in your Teams sidebar (or app list), continue.
 ```
 
 ## Restart
@@ -224,7 +194,7 @@ bot has seen its first message. Tell the user:
 
 ```nc:operator
 The Teams adapter is live and the service is running. One thing is left: your Teams bot's platform ID (which NanoClaw needs to wire it to an agent group) only becomes known after you DM the bot for the first time. To finish:
-1. Find your bot in Teams (search by name, or via the app you just sideloaded) and send it a message ("hi" is fine).
+1. Find your bot in Teams (search by name, or via the app you just installed) and send it a message ("hi" is fine).
 2. Tail logs/nanoclaw.log for the inbound — the router auto-creates a row in messaging_groups in data/v2.db.
 3. Run scripts/init-first-agent.ts with --channel teams, the discovered platform_id, and your AAD user id — OR run /manage-channels to wire it interactively.
 ```
@@ -247,57 +217,71 @@ once you've DM'd the bot, wire this channel with `/init-first-agent` (or
 
 ## Alternatives
 
-### Auto: Teams CLI
+### Multi-tenant bot
 
-The Credentials flow above walks the manual Azure Portal path. If you'd rather
-script it, the Microsoft Teams CLI creates the Entra app, client secret, and bot
-registration in one command. Requires Node.js 18+, a Microsoft 365 account with
-sideloading permissions, and a public HTTPS endpoint (ngrok, Cloudflare Tunnel,
-or similar).
+The Credentials flow above creates a single-tenant bot (only your Microsoft 365
+tenant can install it). For a bot any tenant can install, create it without
+`--sign-in-audience` (the CLI defaults to multi-tenant) and store the matching
+env pairing — `MultiTenant` with **no** tenant ID:
 
-1. Install the CLI:
+```bash
+pnpm exec teams app create --name "NanoClaw" --endpoint "https://your-domain/webhook/teams"
+```
+
+```bash
+TEAMS_APP_ID=<CLIENT_ID from the CLI output>
+TEAMS_APP_PASSWORD=<CLIENT_SECRET from the CLI output>
+TEAMS_APP_TYPE=MultiTenant
+```
+
+Run interactively, the CLI ends with an install menu — pick **Install in Teams**.
+
+### Manual Azure portal path
+
+For tenants where the Teams Developer Portal is blocked. Unlike the CLI path,
+the Azure Bot resource in step 3 requires an active **Azure subscription**.
+This is the classic walk; every value it produces maps onto the same `.env`
+keys.
+
+1. **App registration**: in https://portal.azure.com, search "App registrations"
+   → "New registration". Name it (e.g. "NanoClaw"); Supported account types:
+   Single tenant (most common for self-host) or Multi tenant. From the Overview
+   page copy the **Application (client) ID** and — single tenant only — the
+   **Directory (tenant) ID**.
+2. **Client secret**: in the app registration, "Certificates & secrets" → "New
+   client secret" (expires 180 days or longer). **Copy the Value now** — Azure
+   shows it once (the Value column, not the Secret ID).
+3. **Azure Bot resource**: search "Azure Bot" → Create. Bot handle: any unique
+   name; Type of App: must match step 1; Creation type: "Use existing app
+   registration" with the App ID from step 1. After creating, open the bot →
+   Configuration and set **Messaging endpoint** to
+   `https://your-domain/webhook/teams`, then Apply.
+4. **Enable the Teams channel**: Azure Bot resource → Channels → Microsoft
+   Teams → Accept terms → Apply.
+5. **Store the credentials** in `.env` (the same 401 pairing rule applies —
+   `SingleTenant` needs the tenant ID, `MultiTenant` must omit it):
 
    ```bash
-   npm install -g @microsoft/teams.cli@preview
+   TEAMS_APP_ID=<Application (client) ID>
+   TEAMS_APP_PASSWORD=<client secret Value>
+   TEAMS_APP_TYPE=SingleTenant
+   TEAMS_APP_TENANT_ID=<Directory (tenant) ID>
    ```
-
-2. Sign in and verify:
+6. **Build the app package** (manifest + icons, written in-process to
+   `data/teams/teams-app-package.zip` — no `zip` binary needed):
 
    ```bash
-   teams login
-   teams status
+   pnpm exec tsx setup/channels/teams-manifest-build.ts --app-id YOUR_APP_ID --url https://your-domain
    ```
+7. **Sideload**: Microsoft Teams → Apps → Manage your apps → Upload an app →
+   "Upload a custom app" → select the zip → Add.
+8. Continue from [Restart](#restart).
 
-3. Create the Entra app, client secret, and bot registration:
-
-   ```bash
-   teams app create \
-     --name "NanoClaw" \
-     --endpoint "https://your-domain/api/webhooks/teams"
-   ```
-
-   The CLI prints the credentials as `CLIENT_ID`, `CLIENT_SECRET`, and `TENANT_ID`. Map them to NanoClaw's env keys:
-
-   - `CLIENT_ID` → `TEAMS_APP_ID`
-   - `CLIENT_SECRET` → `TEAMS_APP_PASSWORD`
-   - `TENANT_ID` → `TEAMS_APP_TENANT_ID`
-
-4. Pick **Install in Teams** from the post-create menu and confirm in the Teams dialog.
-
-### Azure CLI for the bot resource
-
-The Azure Bot resource and Teams channel can also be created with `az` instead of
-clicking through the portal:
+Or create the bot resource with the Azure CLI instead of the portal:
 
 ```bash
 az group create --name nanoclaw-rg --location eastus
-az bot create \
-  --resource-group nanoclaw-rg \
-  --name nanoclaw-bot \
-  --app-type SingleTenant \
-  --appid YOUR_APP_ID \
-  --tenant-id YOUR_TENANT_ID \
-  --endpoint "https://your-domain/api/webhooks/teams"
+az bot create --resource-group nanoclaw-rg --name nanoclaw-bot --app-type SingleTenant --appid YOUR_APP_ID --tenant-id YOUR_TENANT_ID --endpoint "https://your-domain/webhook/teams"
 az bot msteams create --resource-group nanoclaw-rg --name nanoclaw-bot
 ```
 
@@ -305,23 +289,26 @@ az bot msteams create --resource-group nanoclaw-rg --name nanoclaw-bot
 
 ### Receive all channel messages (without @-mention)
 
-By default the bot only receives messages when @-mentioned. To receive every
-message in a channel, add an RSC (resource-specific consent) permission to your
-Teams app `manifest.json`:
+By default the bot only receives messages when @-mentioned. With a CLI-created
+bot, grant the resource-specific-consent (RSC) permissions directly — no
+manifest edit, no re-upload; the app version is bumped automatically:
 
-```json
-{
-  "authorization": {
-    "permissions": {
-      "resourceSpecific": [
-        { "name": "ChannelMessage.Read.Group", "type": "Application" }
-      ]
-    }
-  }
-}
+```bash
+pnpm exec teams app rsc add <teams-app-id> ChannelMessage.Read.Group --type Application
+pnpm exec teams app rsc add <teams-app-id> ChatMessage.Read.Chat --type Application
 ```
 
-Re-sideload the updated app package for the change to take effect.
+Then update/reinstall the app in the team so the new permissions get consented.
+(`<teams-app-id>` is the Teams App ID shown in the install step — recover it
+any time with `pnpm exec teams app list`, or find the app at
+https://dev.teams.microsoft.com/apps.)
+
+On the manual path, regenerate the package with RSC baked in and sideload it
+again (the manifest version is bumped so the upload supersedes the original):
+
+```bash
+pnpm exec tsx setup/channels/teams-manifest-build.ts --app-id YOUR_APP_ID --url https://your-domain --rsc
+```
 
 ## Troubleshooting
 
@@ -330,18 +317,55 @@ Re-sideload the updated app package for the change to take effect.
 Your tenant admin has disabled sideloading. Enable it in Teams Admin Center →
 **Teams apps** → **Setup policies** → **Global** → **Upload custom apps** = On.
 Free personal Teams does not support sideloading at all — use a Microsoft 365
-Business / EDU / developer tenant.
+Business / EDU / developer tenant. `pnpm exec teams status` shows whether
+sideloading is enabled at both tenant and user level.
 
 ### Bot never receives messages
 
-1. The tunnel is up and the messaging endpoint matches it: Azure Bot → **Configuration** → **Messaging endpoint** must be `https://<your-domain>/api/webhooks/teams`, and your tunnel (e.g. `ngrok http 3000`) must be forwarding to this machine's port 3000.
-2. The adapter started: `grep -i teams logs/nanoclaw.log | tail`.
-3. The credentials are in `.env` (`TEAMS_APP_ID`, `TEAMS_APP_PASSWORD`, `TEAMS_APP_TYPE`).
+1. The app is actually installed in Teams — if setup was interrupted before
+   the install step, nothing got installed. Recover the install link:
+   `pnpm exec teams app list` shows the Teams App ID, then
+   `pnpm exec teams app get <teams-app-id> --install-link`.
+2. The tunnel is up and the messaging endpoint matches it — the endpoint must
+   be `https://<your-domain>/webhook/teams`, and your tunnel (e.g.
+   `ngrok http 3000`) must be forwarding to this machine's port 3000. Check
+   with `pnpm exec teams app doctor <teams-app-id>` (CLI-created bots) or Azure
+   Bot → **Configuration** (manual path).
+3. The adapter started: `grep -i teams logs/nanoclaw.log | tail`.
+4. The credentials are in `.env` (`TEAMS_APP_ID`, `TEAMS_APP_PASSWORD`,
+   `TEAMS_APP_TYPE`).
+
+### Tunnel URL changed
+
+Point the bot at the new endpoint:
+`pnpm exec teams app update <teams-app-id> --endpoint "https://new-domain/webhook/teams"`
+(manual path: Azure Bot → Configuration → Messaging endpoint).
 
 ### `Unauthorized` / 401 from Azure Bot Service
 
-The client secret is wrong or expired, or — for a Single Tenant app — `TEAMS_APP_TENANT_ID` is missing. Regenerate the secret in **Certificates & secrets** (copy the Value, not the Secret ID), update `.env`, and restart.
+Either the credential pairing is wrong, or the secret is dead:
+
+- **Pairing**: `TEAMS_APP_TYPE=SingleTenant` requires `TEAMS_APP_TENANT_ID`;
+  `MultiTenant` must have **no** tenant ID set. A mismatch authenticates
+  against the wrong authority and every send/receive 401s.
+- **Secret**: expired or mispasted. Rotate with
+  `pnpm exec teams app auth secret create <teams-app-id>` (or Azure portal →
+  Certificates & secrets), update `TEAMS_APP_PASSWORD` in `.env`, and restart.
+
+### Rotate or recreate credentials
+
+The credentials flow skips creation while `.env` has `TEAMS_APP_ID` **or**
+`TEAMS_APP_PASSWORD` — deleting just one line does not make the skill
+regenerate it (that would pair a new app with stale keys). To rotate only the
+secret, use the 401 section above. To start over completely: delete **all**
+`TEAMS_*` lines from `.env`, optionally delete the old app at
+https://dev.teams.microsoft.com/apps (CLI path) or in Azure Portal → App
+registrations (manual path), then re-run this skill. Re-running
+`teams app create` with old credentials still in `.env` would otherwise create
+a second, orphaned app.
 
 ### Replies land in the wrong place
 
-A Teams bot's platform ID is derived from the first inbound activity, so wire the messaging group that the router auto-creates after you DM the bot — don't guess the platform ID. See **Finish wiring** above.
+A Teams bot's platform ID is derived from the first inbound activity, so wire
+the messaging group that the router auto-creates after you DM the bot — don't
+guess the platform ID. See **Finish wiring** above.
