@@ -83,7 +83,8 @@ Create the Slack app (Socket Mode):
 3. App Home → enable the Messages Tab, and check "Allow users to send Slash commands and messages from the messages tab."
 4. Basic Information → App-Level Tokens → "Generate Token and Scopes" → add the connections:write scope → copy the token (starts with xapp-).
 5. Socket Mode → toggle "Enable Socket Mode" on.
-6. Install to Workspace, then copy the Bot User OAuth Token (starts with xoxb-).
+6. Event Subscriptions → toggle "Enable Events" on, then under "Subscribe to bot events" add: message.channels, message.groups, message.im, app_mention. Save Changes. (No Request URL is needed in Socket Mode.)
+7. Install to Workspace, then copy the Bot User OAuth Token (starts with xoxb-).
 ```
 
 For webhook delivery, tell the user:
@@ -122,8 +123,9 @@ SLACK_SIGNING_SECRET={{signing_secret}}
 
 With webhook delivery, the bridge serves port 3000 at `/webhook/slack`
 automatically; to receive replies, that port must be reachable from the internet
-and registered with Slack (Socket Mode skips all of this — events arrive over
-the socket as soon as the service restarts). Tell the user:
+and registered with Slack as the Request URL (Socket Mode needs no public URL —
+with the bot events subscribed above, events arrive over the socket as soon as
+the service restarts). Tell the user:
 
 ```nc:operator when:connection=webhook
 Set up event delivery (needs a public HTTPS URL for port 3000 — ngrok, a Cloudflare Tunnel, or a reverse proxy on a VPS):

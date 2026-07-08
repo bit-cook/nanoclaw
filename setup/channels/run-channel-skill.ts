@@ -15,9 +15,12 @@
  * So the wire lives in exactly one place (init-first-agent) and is never
  * duplicated across channel skills.
  */
+import { writeFileSync } from 'node:fs';
+
 import * as p from '@clack/prompts';
 
 import { firstFailureHint, fullyApplied } from '../../scripts/skill-apply.js';
+import * as setupLog from '../logs.js';
 import { BACK_TO_CHANNEL_SELECTION, backGate, type ChannelFlowResult } from '../lib/back-nav.js';
 import { askOperatorRole, type OperatorRole } from '../lib/role-prompt.js';
 import { ensureAnswer, fail, runQuietChild } from '../lib/runner.js';
@@ -137,12 +140,21 @@ export async function runChannelSkill(
   });
   if (!fullyApplied(res)) {
     if (res.deferred.length) p.log.warn(`Still needs: ${res.deferred.join(', ')}`);
-    for (const t of res.agentTasks) p.log.warn(`Needs an agent (${t.kind}): ${t.reason}`);
-    // On a real bounce, also surface the skill's reference floor (Alternatives /
-    // Optional configuration / Troubleshooting) — the same prose a human reader
-    // would scroll to when a step doesn't apply cleanly. Only on a bounce
-    // (agentTasks), and only when the skill actually ships a reference section.
-    if (res.agentTasks.length && res.referenceProse) p.log.info(res.referenceProse);
+    // A bounced reason can carry a full stderr dump (a Node stacktrace). The
+    // terminal gets ONE line per bounce — the first line, which hostExec
+    // composes as `exit <code>: <first stderr line>` — and the full text goes
+    // to a raw step log, written only when there's actually more than one line
+    // to keep (SSF-004; the reference prose is deliberately not dumped either).
+    let rawLog: string | undefined;
+    if (res.agentTasks.some((t) => t.reason.includes('\n'))) {
+      rawLog = setupLog.stepRawLog(`${channel}-install-bounce`);
+      writeFileSync(rawLog, res.agentTasks.map((t) => `## ${t.kind} (line ${t.line})\n${t.reason}\n`).join('\n'));
+    }
+    for (const t of res.agentTasks) {
+      const lines = t.reason.split('\n').map((l) => l.trim()).filter(Boolean);
+      const more = lines.length > 1 ? ` (+${lines.length - 1} more lines in ${rawLog})` : '';
+      p.log.warn(`Needs an agent (${t.kind}): ${lines[0] ?? t.reason}${more}`);
+    }
     // Surface the bounced step's OWN prose as the failure hint + Claude-handoff
     // context (fail() dims the hint and forwards it to offerClaudeOnFailure),
     // instead of a generic "couldn't finish" message. Only a real bounce yields a
@@ -152,6 +164,7 @@ export async function runChannelSkill(
       `${channel}-install`,
       diag?.headline ?? `Couldn't finish setting up ${channel}.`,
       diag?.hint ?? 'See logs/setup-steps/ for details, then retry setup.',
+      rawLog,
     );
   }
 

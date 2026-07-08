@@ -13,8 +13,8 @@
  * the URL offer, the prose-derived validation message.
  */
 import { execSync, spawn } from 'node:child_process';
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
+import { basename, join } from 'node:path';
 
 import * as p from '@clack/prompts';
 
@@ -30,6 +30,7 @@ import {
 } from '../../scripts/skill-apply.js';
 import { parseDirectives, promptVar } from '../../scripts/skill-directives.js';
 import { extractOfferUrl, gatePolicy } from '../../scripts/skill-policy.js';
+import * as setupLog from '../logs.js';
 import { isHeadless } from '../platform.js';
 import { openUrl } from './browser.js';
 import { isHelpEscape, offerClaudeHandoff, validateWithHelpEscape } from './claude-handoff.js';
@@ -57,6 +58,19 @@ export function promptValidator(
 }
 
 /**
+ * The literal alternatives of a fully-anchored pure-literal alternation —
+ * `^(socket|webhook)$` → ['socket', 'webhook'] — or null for anything else
+ * (an unanchored prefix like `^xoxb-`, a format union with real regex syntax
+ * like imessage's `^(\+\d{8,15}|…)$`). This is what lets an either/or
+ * `nc:prompt` render as an arrow-key select with no grammar addition: the
+ * validate regex already enumerates the choices. Exported for tests.
+ */
+export function literalChoices(validate: string | undefined): string[] | null {
+  const m = validate?.match(/^\^\(([A-Za-z0-9_-]+(?:\|[A-Za-z0-9_-]+)+)\)\$$/);
+  return m ? m[1].split('|') : null;
+}
+
+/**
  * Handoff context for the `?` help-escape (Step 8 / mechanism M3). A lone `?` at
  * any prompt hands the operator to interactive Claude with this context, then
  * re-asks the same prompt. Both fields are optional so a bare
@@ -73,9 +87,10 @@ export interface PrompterContext {
 
 /**
  * The wizard's `resolveInput` implementation: collect an `nc:prompt` through
- * clack (password for secrets, text otherwise; a cancel defers), running the
- * interactive re-ask loop against the prompt's declared `validate:`/`flags:`
- * (the engine's validate-at-bind is the programmatic backstop, not the UX).
+ * clack (password for secrets, an arrow-key select for an either/or validate
+ * regex, text otherwise; a cancel defers), running the interactive re-ask loop
+ * against the prompt's declared `validate:`/`flags:` (the engine's
+ * validate-at-bind is the programmatic backstop, not the UX).
  */
 export function clackResolveInput(ctx: PrompterContext = {}): (name: string, meta: InputMeta) => Promise<string | undefined> {
   // The `?` help-escape is only meaningful at a real terminal: it hands the
@@ -90,9 +105,15 @@ export function clackResolveInput(ctx: PrompterContext = {}): (name: string, met
     const guarded = validateWithHelpEscape(check);
     // clearOnError wipes a rejected secret so the operator re-pastes cleanly
     // (a half-pasted token isn't left masked in the field).
-    const ans = meta.secret
-      ? await p.password({ message: meta.question, validate: guarded, clearOnError: true })
-      : await p.text({ message: meta.question, validate: guarded });
+    // An either/or prompt renders as an arrow-key select — the options come
+    // straight from the validate regex (literalChoices). No re-ask loop and no
+    // `?` help-escape there: every choice is valid and self-describing.
+    const choices = meta.secret ? null : literalChoices(meta.validate);
+    const ans = choices
+      ? await p.select({ message: meta.question, options: choices.map((c) => ({ value: c, label: c })) })
+      : meta.secret
+        ? await p.password({ message: meta.question, validate: guarded, clearOnError: true })
+        : await p.text({ message: meta.question, validate: guarded });
     if (p.isCancel(ans)) return undefined; // cancelled ⇒ defer
     if (isHelpEscape(ans) && process.stdout.isTTY) {
       // Operator asked for help: hand off to interactive Claude with this
@@ -224,14 +245,45 @@ async function reuseFromEnv(
  * `run capture:<var>` can bind it. Puts the project's `bin/` on PATH so a bare
  * `ncl …` in a wire directive resolves to `bin/ncl` even when it isn't
  * symlinked onto the operator's PATH.
+ *
+ * Async (spawn, not execSync) so the step spinner keeps animating: a sync exec
+ * blocks the event loop for the whole command and freezes every ticker in the
+ * process. A failure rejects with the FIRST line as the actionable summary —
+ * `exit <code>: <first stderr line>` — and the full stderr kept below, so
+ * one-line consumers (run-channel-skill's bounce warn) stay readable while the
+ * agentTask reason an agent fixes from still carries everything.
+ *
+ * Non-step effects are captured-output steps — the spinner is the only UI, and
+ * stderr is piped, never echoed (a chatty tool's warnings don't belong on the
+ * wizard screen). When `rawLog` is given, every command's stdout+stderr is
+ * appended there (level 3, like runner.ts's per-step raw logs) so the silenced
+ * noise stays inspectable.
  */
-export function hostExec(projectRoot: string): (cmd: string) => string {
+export function hostExec(projectRoot: string, rawLog?: string): (cmd: string) => Promise<string> {
+  const tee = (cmd: string, stdout: string, stderr: string): void => {
+    if (!rawLog) return;
+    const body = [stdout, stderr].filter(Boolean).join('');
+    appendFileSync(rawLog, `$ ${cmd}\n${body}${body && !body.endsWith('\n') ? '\n' : ''}\n`);
+  };
   return (cmd) =>
-    execSync(cmd, {
-      cwd: projectRoot,
-      shell: '/bin/bash',
-      encoding: 'utf8',
-      env: { ...process.env, PATH: `${join(projectRoot, 'bin')}:${process.env.PATH ?? ''}` },
+    new Promise((resolve, reject) => {
+      const child = spawn('bash', ['-c', cmd], {
+        cwd: projectRoot,
+        env: { ...process.env, PATH: `${join(projectRoot, 'bin')}:${process.env.PATH ?? ''}` },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let out = '';
+      let err = '';
+      child.stdout.on('data', (c: Buffer) => { out += c.toString('utf8'); });
+      child.stderr.on('data', (c: Buffer) => { err += c.toString('utf8'); });
+      child.on('error', reject);
+      child.on('close', (code) => {
+        tee(cmd, out, err);
+        if (code === 0) return resolve(out);
+        const stderr = err.trim();
+        const head = stderr.split('\n').map((l) => l.trim()).find(Boolean) ?? 'command failed';
+        reject(new Error(`exit ${code ?? '?'}: ${head}${stderr ? `\n${stderr}` : ''}`));
+      });
     });
 }
 
@@ -248,7 +300,20 @@ export function hostExecStream(projectRoot: string): (cmd: string) => Promise<St
     new Promise((resolve) => {
       const child = spawn('bash', ['-c', cmd], {
         cwd: projectRoot,
-        env: { ...process.env, PATH: `${join(projectRoot, 'bin')}:${process.env.PATH ?? ''}` },
+        env: {
+          ...process.env,
+          PATH: `${join(projectRoot, 'bin')}:${process.env.PATH ?? ''}`,
+          // A step renders curated operator UI (a code card, a QR) — the host
+          // logger's info noise doesn't belong on the wizard screen, and it
+          // always emits ANSI so it can't be filtered by stream. Warnings and
+          // errors still pass. An operator-set LOG_LEVEL wins (debugging).
+          LOG_LEVEL: process.env.LOG_LEVEL ?? 'warn',
+          // The child's stdout is a pipe, so picocolors would strip its clack
+          // rendering to bare box chars that clash with the wizard theme.
+          // When the OPERATOR's terminal is a real TTY, the teed lines land
+          // there — force color so the child's card matches the parent.
+          ...(process.stdout.isTTY ? { FORCE_COLOR: '1' } : {}),
+        },
         stdio: ['inherit', 'pipe', 'pipe'],
       });
       const blocks: Array<{ fields: Record<string, string> }> = [];
@@ -351,7 +416,7 @@ function defaultOnEvent(
       return;
     }
     // operator: note → URL offer → natural-barrier confirm.
-    p.note(e.text, 'Do this');
+    p.note(e.text, 'Your turn');
     const url = extractOfferUrl(e.text);
     if (url !== undefined && (await confirm(`Open ${url} in your browser?`))) await open(url);
     const gate = gates.get(e.line);
@@ -382,7 +447,7 @@ export interface RunSkillOptions {
    */
   resolveInput?: (name: string, meta: InputMeta) => Promise<string | undefined>;
   /** Defaults to `hostExec`. */
-  exec?: (cmd: string) => string | void;
+  exec?: (cmd: string) => string | void | Promise<string | void>;
   /** Defaults to `hostExecStream`. Streaming exec for `nc:run effect:step`. */
   execStream?: (cmd: string) => Promise<StepOutcome>;
   /** Defaults to the fork-aware channels-branch resolver. */
@@ -445,11 +510,19 @@ export async function runSkill(skillDir: string, opts: RunSkillOptions = {}): Pr
   } catch {
     // missing SKILL.md — the engine will produce an empty result anyway
   }
+  // One raw log per skill apply (level 3): every default-exec command appends
+  // its `$ cmd` + output there. Allocated only when the default exec is used —
+  // an injected exec (tests, agent relay) owns its own capture.
+  let rawLog: string | undefined;
+  if (!opts.exec) {
+    rawLog = setupLog.stepRawLog(`skill-${basename(skillDir)}`);
+    writeFileSync(rawLog, `# skill ${basename(skillDir)} — ${new Date().toISOString()}\n\n`);
+  }
   return applySkill(skillDir, projectRoot, {
     inputs,
     resolveInput: opts.resolveInput ?? clackResolveInput({ channel: opts.channel, step: opts.step }),
     onEvent: opts.onEvent ?? defaultOnEvent(md, confirm, open),
-    exec: opts.exec ?? hostExec(projectRoot),
+    exec: opts.exec ?? hostExec(projectRoot, rawLog),
     execStream: opts.execStream ?? hostExecStream(projectRoot),
     resolveRemote: opts.resolveRemote ?? channelsRemote(projectRoot),
     skipEffects: opts.skipEffects,

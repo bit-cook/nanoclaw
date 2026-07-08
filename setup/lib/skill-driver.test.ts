@@ -3,7 +3,7 @@ import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, chmodSync } from '
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { runSkill, hostExec, hostExecStream, labelOrdinals, promptValidator, clackResolveInput, type RunSkillOptions } from './skill-driver.js';
+import { runSkill, hostExec, hostExecStream, labelOrdinals, literalChoices, promptValidator, clackResolveInput, type RunSkillOptions } from './skill-driver.js';
 import { fullyApplied, type ApplyEvent } from '../../scripts/skill-apply.js';
 
 // Shared test state for the clack + claude-handoff mocks (hoisted so the vi.mock
@@ -15,6 +15,7 @@ const ce = vi.hoisted(() => ({
   handoffSpy: vi.fn(async (_ctx: { channel: string; step: string; stepDescription: string }) => true),
   answers: [] as string[],
   lastValidate: { fn: undefined as undefined | ((v: string) => string | Error | void | undefined) },
+  lastSelectOptions: { values: undefined as undefined | string[] },
 }));
 
 // Keep isHelpEscape + validateWithHelpEscape real (clackResolveInput uses them);
@@ -32,7 +33,11 @@ vi.mock('@clack/prompts', async (importActual) => {
     ce.lastValidate.fn = o?.validate;
     return ce.answers.shift() ?? '';
   };
-  return { ...actual, text: vi.fn(fromQueue), password: vi.fn(fromQueue) };
+  const fromQueueSelect = async (o: { options: Array<{ value: string }> }): Promise<string> => {
+    ce.lastSelectOptions.values = o.options.map((x) => x.value);
+    return ce.answers.shift() ?? o.options[0].value;
+  };
+  return { ...actual, text: vi.fn(fromQueue), password: vi.fn(fromQueue), select: vi.fn(fromQueueSelect) };
 });
 
 // A small SKILL.md exercising the three things the driver wires: an operator
@@ -113,18 +118,39 @@ describe('thin skill driver', () => {
     expect(starts).toEqual([{ kind: 'run', label: 'Wire' }]);
   });
 
-  it('hostExec puts the project bin/ on PATH so a bare command resolves to it', () => {
+  it('hostExec puts the project bin/ on PATH so a bare command resolves to it', async () => {
     const root = mkdtempSync(join(tmpdir(), 'driver-bin-'));
     mkdirSync(join(root, 'bin'));
     writeFileSync(join(root, 'bin/greet'), '#!/usr/bin/env bash\necho hi-from-bin\n');
     chmodSync(join(root, 'bin/greet'), 0o755);
-    const out = hostExec(root)('greet'); // bare name, not ./bin/greet
+    const out = await hostExec(root)('greet'); // bare name, not ./bin/greet
     expect(String(out).trim()).toBe('hi-from-bin');
   });
 
-  it('hostExec returns stdout so a capture run can bind it', () => {
+  it('hostExec returns stdout so a capture run can bind it', async () => {
     const root = mkdtempSync(join(tmpdir(), 'driver-cap-'));
-    expect(String(hostExec(root)('echo D0CHANNEL')).trim()).toBe('D0CHANNEL');
+    expect(String(await hostExec(root)('echo D0CHANNEL')).trim()).toBe('D0CHANNEL');
+  });
+
+  it('hostExec recomposes a failure as `exit <code>: <first stderr line>` with the full stderr kept below', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'driver-fail-'));
+    const run = (): Promise<string> => hostExec(root)('echo "boom: first line" >&2; echo "stack line two" >&2; exit 7');
+    await expect(run).rejects.toThrow(/^exit 7: boom: first line/); // one-line consumers read this
+    await expect(run).rejects.toThrow(/stack line two/); // full stderr survives for the agentTask reason
+  });
+
+  it('hostExec tees each command + stdout/stderr to the raw log, success and failure alike', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'driver-tee-'));
+    const rawLog = join(root, 'raw.log');
+    const exec = hostExec(root, rawLog);
+    await exec('echo out-line; echo warn-line >&2');
+    await expect(exec('echo dying-gasp >&2; exit 3')).rejects.toThrow(/exit 3/);
+    const log = readFileSync(rawLog, 'utf8');
+    expect(log).toContain('$ echo out-line; echo warn-line >&2');
+    expect(log).toContain('out-line');
+    expect(log).toContain('warn-line'); // stderr captured, not echoed to the wizard
+    expect(log).toContain('$ echo dying-gasp >&2; exit 3');
+    expect(log).toContain('dying-gasp'); // the failing command's output survives too
   });
 
   it('hostExecStream runs a step and captures the terminal status block fields (for effect:step)', async () => {
@@ -134,6 +160,20 @@ describe('thin skill driver', () => {
     );
     expect(out.ok).toBe(true);
     expect(out.fields.PLATFORM_ID).toBe('telegram:42');
+  });
+
+  it('hostExecStream children run with LOG_LEVEL=warn — host logger info noise stays off the wizard', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'driver-loglevel-'));
+    const prev = process.env.LOG_LEVEL;
+    delete process.env.LOG_LEVEL; // simulate an operator who didn't set one
+    try {
+      const out = await hostExecStream(root)(
+        'echo "=== NANOCLAW SETUP: ENV ==="; echo "STATUS: success"; echo "LVL: $LOG_LEVEL"; echo "=== END ==="',
+      );
+      expect(out.fields.LVL).toBe('warn');
+    } finally {
+      if (prev !== undefined) process.env.LOG_LEVEL = prev;
+    }
   });
 
   function reuseScratch(): { root: string; skill: string } {
@@ -379,6 +419,18 @@ describe('thin skill driver', () => {
     }
   });
 
+  it('clackResolveInput renders an either/or validate as an arrow-key select over the literal choices', async () => {
+    ce.answers = ['webhook'];
+    ce.lastSelectOptions.values = undefined;
+    const ans = await clackResolveInput()('connection', {
+      question: 'How should Slack deliver events?',
+      secret: false,
+      validate: '^(socket|webhook)$',
+    });
+    expect(ans).toBe('webhook');
+    expect(ce.lastSelectOptions.values).toEqual(['socket', 'webhook']); // the options came from the regex
+  });
+
   it('clackResolveInput passes a normal answer straight through — no handoff', async () => {
     ce.handoffSpy.mockClear();
     ce.answers = ['just-a-token'];
@@ -399,6 +451,27 @@ describe('thin skill driver', () => {
     // describes the expected shape, so no authored error: string exists anymore
     expect(ci!('ftp://example.com')).toBe(`That doesn't match the expected format. ${question}`);
     expect(promptValidator(undefined, undefined, question)).toBeUndefined(); // no regex ⇒ no validator
+  });
+});
+
+// An either/or `nc:prompt` renders as a select — the choices come from the
+// validate regex itself (no grammar addition). Only a fully-anchored
+// pure-literal alternation qualifies; anything with real regex syntax stays a
+// text prompt (SSF-003).
+describe('literalChoices (either/or prompt → select)', () => {
+  it('extracts the choices from a pure-literal alternation', () => {
+    expect(literalChoices('^(socket|webhook)$')).toEqual(['socket', 'webhook']);
+    expect(literalChoices('^(qr|pairing-code)$')).toEqual(['qr', 'pairing-code']);
+    expect(literalChoices('^(SingleTenant|MultiTenant)$')).toEqual(['SingleTenant', 'MultiTenant']);
+  });
+
+  it('leaves prefixes, format unions, and non-alternations as text prompts', () => {
+    expect(literalChoices('^xoxb-')).toBeNull(); // unanchored prefix
+    expect(literalChoices('^https?://')).toBeNull(); // regex metachars
+    expect(literalChoices('^(\\+\\d{8,15}|[^\\s@]+@[^\\s@]+\\.[^\\s@]+)$')).toBeNull(); // imessage phone|email union
+    expect(literalChoices('^[0-9a-zA-Z-]+$')).toBeNull(); // char class, no alternation
+    expect(literalChoices('^(solo)$')).toBeNull(); // one option is not a choice
+    expect(literalChoices(undefined)).toBeNull();
   });
 });
 

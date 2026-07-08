@@ -2,9 +2,9 @@
  * Step: pair-telegram — issue a one-time pairing code and wait for the
  * operator to send the code from the chat they want to register.
  *
- * Emits machine-readable status blocks only. The parent driver
- * (`setup:auto`) renders the code / attempt / success UI with clack. Running
- * this step directly will look sparse — that's intentional.
+ * Renders the human-facing code card itself (see printCodeCard) and emits
+ * machine-readable status blocks alongside for the programmatic callers
+ * (/manage-channels, /init-first-agent) that parse them.
  *
  * Blocks emitted:
  *   PAIR_TELEGRAM_CODE       { CODE, REASON=initial|regenerated }
@@ -19,6 +19,8 @@
  * runtime — tsc won't complain on branches that haven't run add-telegram yet.
  */
 import path from 'path';
+
+import * as p from '@clack/prompts';
 
 import {
   createPairing,
@@ -56,34 +58,26 @@ function intentToString(intent: PairingIntent): string {
 }
 
 /**
- * Render the pairing code and live feedback as PLAIN stdout lines.
+ * Render the pairing code card with clack's STATIC primitives (note/log).
  *
  * The Option A driver's streaming exec (setup/lib/skill-driver.ts
  * `hostExecStream`) CONSUMES the `=== NANOCLAW SETUP: … ===` status blocks (it
- * does not show them) and tees every OTHER stdout line straight to the
- * operator's terminal. So the human-facing code card has to be printed as plain
- * lines here — the bespoke setup/channels/telegram.ts used to render these from
- * the blocks, and that rendering now lives in the step itself. The structured
- * blocks are still emitted alongside for the agent-driven callers
- * (/manage-channels, /init-first-agent) that parse them.
+ * does not show them) and tees every OTHER stdout line verbatim to the
+ * operator's terminal. Static clack output is just lines, so it survives that
+ * tee and reads like the rest of the wizard — only INTERACTIVE/animated clack
+ * widgets need the real TTY the piped child doesn't have (SSF-002).
  */
 function printCodeCard(code: string, reason: 'initial' | 'regenerated'): void {
   const spaced = code.split('').join('   ');
-  console.log('');
-  console.log(
-    reason === 'initial'
-      ? 'Your pairing code is ready.'
-      : 'That code was used up — here is a fresh one.',
+  p.note(
+    `${spaced}\n\nSend these 4 digits to your bot from Telegram.`,
+    reason === 'initial' ? 'Your pairing code is ready' : 'That code was used up — here is a fresh one',
   );
-  console.log('');
-  console.log(`    ${spaced}`);
-  console.log('');
-  console.log('Send these 4 digits to your bot from Telegram.');
-  console.log('Waiting for you to send the code…');
+  p.log.message('Waiting for you to send the code…');
 }
 
 function printAttempt(candidate: string): void {
-  console.log(`Got "${candidate}", which doesn't match — waiting for the correct code…`);
+  p.log.warn(`Got "${candidate}", which doesn't match — waiting for the correct code…`);
 }
 
 export async function run(args: string[]): Promise<void> {
@@ -115,7 +109,7 @@ export async function run(args: string[]): Promise<void> {
         },
       });
 
-      console.log('\nTelegram paired.');
+      p.log.success('Telegram paired.');
       emitStatus('PAIR_TELEGRAM', {
         STATUS: 'success',
         CODE: record.code,
