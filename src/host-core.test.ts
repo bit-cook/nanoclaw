@@ -19,6 +19,7 @@ import {
 } from './db/index.js';
 import {
   resolveSession,
+  resolveTaskSession,
   writeSessionMessage,
   writeSessionRouting,
   initSessionFolder,
@@ -951,6 +952,32 @@ describe('writeSessionRouting', () => {
     expect(row!.channel_type).toBeNull();
     expect(row!.platform_id).toBeNull();
     expect(row!.thread_id).toBeNull();
+  });
+
+  it('stamps is_task=1 for a task-series session and 0 for chat sessions', () => {
+    createAgentGroup({
+      id: 'ag-1',
+      name: 'Agent',
+      folder: 'agent',
+      agent_provider: null,
+      created_at: now(),
+    });
+
+    const { session: taskSession } = resolveTaskSession('ag-1', 'daily-abc1');
+    writeSessionRouting('ag-1', taskSession.id);
+
+    let db = new Database(inboundDbPath('ag-1', taskSession.id));
+    const taskRow = db.prepare('SELECT is_task FROM session_routing WHERE id = 1').get() as { is_task: number };
+    db.close();
+    expect(taskRow.is_task).toBe(1);
+
+    const { session: chatSession } = resolveSession('ag-1', null, null, 'agent-shared');
+    writeSessionRouting('ag-1', chatSession.id);
+
+    db = new Database(inboundDbPath('ag-1', chatSession.id));
+    const chatRow = db.prepare('SELECT is_task FROM session_routing WHERE id = 1').get() as { is_task: number };
+    db.close();
+    expect(chatRow.is_task).toBe(0);
   });
 
   it('includes thread_id from per-thread session', () => {

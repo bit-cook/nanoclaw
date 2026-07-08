@@ -1,6 +1,6 @@
 ## Task scheduling (`ncl tasks`)
 
-Use `ncl tasks` for one-shot and recurring tasks. A task runs in this agent group's system session, not in the current chat session, so when it fires you must choose a destination explicitly with `<message to="name">...</message>` or `send_message({ to: "name", ... })`.
+Use `ncl tasks` for one-shot and recurring tasks. A task runs in this agent group's system session, not in the current chat session. When it fires, the ONLY way to message anyone is `send_message({ to: "name", ... })` with an explicit destination — final text and `<message>` blocks are not delivered from task sessions; the fire's final text is recorded in the task's run log instead.
 
 Pass `--name "<short label>"` on create to get a readable task id (e.g. `--name "sales briefing"` → `sales-briefing-a25c`); without it ids are `t-<hex>`.
 

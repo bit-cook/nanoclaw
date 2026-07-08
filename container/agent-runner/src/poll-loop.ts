@@ -1,6 +1,6 @@
 import { findByName, getAllDestinations, type DestinationEntry } from './destinations.js';
 import { getPendingMessages, markProcessing, markCompleted, markScriptSkipped, type MessageInRow } from './db/messages-in.js';
-import { hasIdenticalSend, writeMessageOut } from './db/messages-out.js';
+import { hasAppendLogRequestSince, maxSeq, writeMessageOut } from './db/messages-out.js';
 import { getInboundDb, touchHeartbeat, clearStaleProcessingAcks } from './db/connection.js';
 import {
   clearContinuation,
@@ -340,6 +340,9 @@ export async function processQuery(
   let queryContinuation: string | undefined;
   let done = false;
   let unwrappedNudged = false;
+  // Once-per-turn guard for the task-fire "<message> block was not delivered"
+  // nudge — mirrors unwrappedNudged for chat turns.
+  let taskBlockNudged = false;
   // Prompt queue for the exchange hook — each result event consumes the
   // oldest unanswered prompt, except a wrapping-retry result, which answers
   // the same prompt again. Unused (and unmaintained) when the provider
@@ -423,6 +426,7 @@ export async function processQuery(
         const prompt = formatMessages(keep);
         log(`Pushing ${keep.length} follow-up message(s) into active query`);
         unwrappedNudged = false;
+        taskBlockNudged = false;
         query.push(prompt);
         archivePrompts.push(prompt);
         markCompleted(keptIds);
@@ -464,6 +468,10 @@ export async function processQuery(
     })();
   }, ACTIVE_POLL_INTERVAL_MS);
 
+  // Seq watermark before the agent runs — anything after this is "this fire"
+  // for the append-log exactly-once guard.
+  const turnStartSeq = maxSeq();
+
   try {
     for await (const event of query.events) {
       handleEvent(event, routing);
@@ -487,8 +495,15 @@ export async function processQuery(
         // at all — either way the turn is finished.
         markCompleted(initialBatchIds);
         if (event.text) {
-          const { sent, hasUnwrapped } = dispatchResultText(event.text, routing);
-          if (sent === 0 && event.isError === true) {
+          const { sent, hasUnwrapped, taskBlocks } = dispatchResultText(event.text, routing);
+          const willRetryTaskBlocks = shouldNudgeTaskBlocks(routing.taskFire === true, taskBlocks, taskBlockNudged);
+          // One-door task delivery: the final text becomes the run log entry
+          // (guarded — an explicit append-log this fire wins). Errors included:
+          // a failed fire's text belongs in the run log, not in a chat.
+          // When we nudge on inert <message> blocks, DEFER the append to the
+          // retry's result so the fire logs exactly once.
+          if (routing.taskFire && !willRetryTaskBlocks) autoAppendTaskLog(event.text, turnStartSeq);
+          if (sent === 0 && event.isError === true && !routing.taskFire) {
             // Non-retryable error turn (e.g. a 403 billing_error) with no
             // <message> envelope: deliver the notice instead of dropping it as
             // scratchpad, and skip the re-wrap nudge — it would just re-hammer
@@ -520,9 +535,20 @@ export async function processQuery(
                   `Please re-send your response with the correct wrapping.</system>`,
               );
             }
-            // The wrapping-retry result answers the SAME user prompt — keep it
-            // queued so the retry archives against it, not the nudge text.
-            if (!willRetryWrapping) archivePrompts.shift();
+            if (willRetryTaskBlocks) {
+              taskBlockNudged = true;
+              const names = getAllDestinations()
+                .map((d) => d.name)
+                .join(', ');
+              query.push(
+                `<system>Your <message> block was NOT delivered — task sessions deliver only via the send_message tool. ` +
+                  `Re-send now with send_message({to: "<name>", ...}). Your destinations: ${names}.</system>`,
+              );
+            }
+            // A retry result (wrapping or task-block nudge) answers the SAME
+            // user prompt — keep it queued so the retry archives against it,
+            // not the nudge text.
+            if (!willRetryWrapping && !willRetryTaskBlocks) archivePrompts.shift();
           }
         } else {
           archivePrompts.shift();
@@ -605,11 +631,17 @@ function deliverErrorResult(text: string, routing: RoutingContext): void {
  * The agent must always wrap output in <message to="name">...</message>
  * blocks, even with a single destination. Bare text is scratchpad only.
  */
-function dispatchResultText(text: string, routing: RoutingContext): { sent: number; hasUnwrapped: boolean } {
+export function dispatchResultText(
+  text: string,
+  routing: RoutingContext,
+): { sent: number; hasUnwrapped: boolean; taskBlocks: number } {
   const MESSAGE_RE = /<message\s+to="([^"]+)"\s*>([\s\S]*?)<\/message>/g;
 
   let match: RegExpExecArray | null;
   let sent = 0;
+  // <message to> blocks left inert in a task fire — drives the same-turn
+  // "use send_message" nudge in processQuery.
+  let taskBlocks = 0;
   let lastIndex = 0;
   const scratchpadParts: string[] = [];
 
@@ -621,6 +653,16 @@ function dispatchResultText(text: string, routing: RoutingContext): { sent: numb
     const body = match[2].trim();
     lastIndex = MESSAGE_RE.lastIndex;
 
+    // One-door delivery in task sessions: only the send_message tool delivers.
+    // A final-text <message to> block here is either an echo of a tool send the
+    // agent already made (the double-delivery class) or a send down the wrong
+    // path — never deliver it, keep it visible in the scratchpad/run log.
+    if (routing.taskFire) {
+      log(`Task fire: <message to="${toName}"> block not delivered — task sessions send only via send_message`);
+      scratchpadParts.push(`[not delivered — task sessions send only via the send_message tool; to="${toName}"] ${body}`);
+      taskBlocks++;
+      continue;
+    }
     const dest = findByName(toName);
     if (!dest) {
       log(`Unknown destination in <message to="${toName}">, dropping block`);
@@ -640,25 +682,57 @@ function dispatchResultText(text: string, routing: RoutingContext): { sent: numb
     log(`[scratchpad] ${scratchpad.slice(0, 500)}${scratchpad.length > 500 ? '…' : ''}`);
   }
 
-  const hasUnwrapped = sent === 0 && !!scratchpad;
+  // In a task fire, plain final text is the NORMAL ending (it becomes the run
+  // log) — never treat it as an undelivered reply or nudge the agent to wrap it.
+  const hasUnwrapped = !routing.taskFire && sent === 0 && !!scratchpad;
   if (hasUnwrapped) {
     log(`WARNING: agent output had no <message to="..."> blocks — nothing was sent`);
   }
-  return { sent, hasUnwrapped };
+  return { sent, hasUnwrapped, taskBlocks };
+}
+
+/**
+ * Should this task-fire result get the same-turn "your <message> block was
+ * not delivered — use send_message" nudge? True at most once per turn
+ * (mirrors the unwrappedNudged flag for chat turns). While true, the run-log
+ * auto-append is DEFERRED to the retry's result so the fire logs exactly once.
+ */
+export function shouldNudgeTaskBlocks(taskFire: boolean, taskBlocks: number, alreadyNudged: boolean): boolean {
+  return taskFire && taskBlocks > 0 && !alreadyNudged;
+}
+
+/**
+ * Task fires: the final text IS the run log entry, unless the agent already
+ * logged this fire explicitly via `ncl tasks append-log` (exactly-once guard —
+ * old tasks whose baked-in prompt still mandates append-log don't double-log).
+ * Written as a `task_log` outbound row; the host appends it to the series'
+ * tasks/<id>.md with its usual timestamp stamp. Never delivered to anyone.
+ */
+export function autoAppendTaskLog(text: string, turnStartSeq: number): void {
+  // Run-log hygiene: an inert <message to> block never belongs in the log as
+  // raw XML — replace each with its inner text, marked undelivered, so the
+  // log stays readable prose.
+  const prose = text.replace(
+    /<message\s+to="([^"]+)"\s*>([\s\S]*?)<\/message>/g,
+    (_m, to: string, body: string) => `[undelivered → ${to}] ${body.trim()}`,
+  );
+  const line = stripInternalTags(prose).replace(/\s+/g, ' ').trim().slice(0, 500);
+  if (!line) return;
+  if (hasAppendLogRequestSince(turnStartSeq)) {
+    log('Task fire already logged via append-log — skipping final-text auto-log');
+    return;
+  }
+  writeMessageOut({
+    id: generateId(),
+    kind: 'task_log',
+    content: JSON.stringify({ text: line }),
+  });
+  log('Task fire run log auto-appended from final text');
 }
 
 function sendToDestination(dest: DestinationEntry, body: string, routing: RoutingContext): void {
   const platformId = dest.type === 'channel' ? dest.platformId! : dest.agentGroupId!;
   const channelType = dest.type === 'channel' ? dest.channelType! : 'agent';
-  // Task fires: an explicitly-addressed final-text block is either the echo of
-  // an MCP send the agent already made this turn (drop it HERE, where the
-  // duplication originates) or the agent's only deliberate send (write it
-  // in_reply_to-null like the MCP path, or the host's task-fire suppression
-  // would discard it — zero delivery).
-  if (routing.taskFire && hasIdenticalSend(platformId, channelType, body)) {
-    log(`Dropping turn-final echo of an already-sent task message to ${dest.name}`);
-    return;
-  }
   // Resolve thread_id per-destination from the most recent inbound message
   // that came from this same channel+platform. In agent-shared sessions,
   // different destinations have different thread contexts — using a single
@@ -666,7 +740,7 @@ function sendToDestination(dest: DestinationEntry, body: string, routing: Routin
   const destRouting = resolveDestinationThread(channelType, platformId);
   writeMessageOut({
     id: generateId(),
-    in_reply_to: destRouting?.inReplyTo ?? (routing.taskFire ? null : routing.inReplyTo),
+    in_reply_to: destRouting?.inReplyTo ?? routing.inReplyTo,
     kind: 'chat',
     platform_id: platformId,
     channel_type: channelType,

@@ -26,6 +26,7 @@ import {
 import { inboundDbPath, resolveTaskSession, withInboundDb } from '../../session-manager.js';
 import { parseZonedToUtc } from '../../timezone.js';
 import { registerResource } from '../crud.js';
+import { appendRunLog } from '../../modules/scheduling/run-log.js';
 import { formatTasksTable } from '../format-tasks.js';
 import type { CallerContext } from '../frame.js';
 
@@ -284,11 +285,9 @@ function createTask(args: Record<string, unknown>, ctx: CallerContext) {
   const { session } = resolveTaskSession(group, id);
   const promptWithLog =
     `${prompt}\n\n` +
-    `[A task serves the user two separate ways — do whichever the task above asks for, and ALWAYS the run log:\n` +
-    `• MESSAGE (only if asked): if the task says to report/notify the user, send your result with an EXPLICIT destination — <message to="name">…</message> or send_message({ to: "name", … }). This run has no chat attached: an unaddressed reply is DISCARDED, so the explicit send is the ONLY thing the user receives.\n` +
-    `• RUN LOG (ALWAYS — even if you sent no message and did nothing else this run): after any sends, end the run with:\n` +
-    `    ncl tasks append-log --msg "<what you did, and why it mattered>"\n` +
-    `  Write it like a work-log entry a human keeps — concrete: what you did and WHY (a no-op run still gets a line saying why nothing was needed). If you wrote or modified files this run, name them in --msg. Not a greeting, not a copy of the message you sent. The host stamps the UTC time (do NOT add one), do NOT edit tasks/${id}.md by hand, and this NEVER goes to the user.\n` +
+    `[Task delivery contract:\n` +
+    `• MESSAGE (only if the task asks you to report/notify): use send_message({ to: "name", … }) with an explicit destination — that tool call is the ONLY thing the user receives. This run has no chat attached: final text and <message> blocks are NOT delivered here.\n` +
+    `• RUN LOG (automatic): your final text is recorded verbatim in tasks/${id}.md — end the run with a concrete work-log line: what you did and WHY (a no-op run still ends with why nothing was needed; name any files you wrote). Not a greeting, not a copy of the message you sent. For extra mid-run notes use \`ncl tasks append-log --msg "…"\` — if you do, your final text is not auto-logged. Do NOT edit tasks/${id}.md by hand; the log never goes to the user.\n` +
     `Need context from past runs? Read tasks/${id}.md first.]`;
 
   const created = withInbound(session, (db) => {
@@ -329,22 +328,12 @@ function appendTaskLog(
     }
   }
   if (!series) throw new Error('--id is required (no task session to derive it from)');
-  // Charset guard is the security boundary here: blocks path traversal and keeps
-  // the id safe as a filename / thread suffix. Group scope is already enforced by
-  // groupArg (a cli_scope=group caller can only ever resolve its own folder), so a
-  // foreign id at worst writes a stray log under the caller's OWN folder — no leak.
-  if (!/^[a-z0-9-]+$/.test(series)) throw new Error(`invalid task id: ${series}`);
   if (!group) throw new Error('could not resolve the agent group');
 
-  const ag = getAgentGroup(group);
-  if (!ag) throw new Error(`agent group not found: ${group}`);
-
-  const timestamp = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
-  const dir = `${GROUPS_DIR}/${ag.folder}/tasks`;
-  const file = `${dir}/${series}.md`;
-  fs.mkdirSync(dir, { recursive: true });
-  fs.appendFileSync(file, `${timestamp} — ${msg}\n`);
-  return { series, timestamp, path: file, ok: true };
+  // Group scope is enforced by groupArg (a cli_scope=group caller can only
+  // ever resolve its own folder), so a foreign id at worst writes a stray log
+  // under the caller's OWN folder — no leak. appendRunLog guards the charset.
+  return { ...appendRunLog(group, series, msg), ok: true };
 }
 
 /**
@@ -659,7 +648,7 @@ registerResource({
     'append-log': {
       access: 'open',
       description:
-        'Append a one-line run summary to a task run log (tasks/<id>.md).\n\nThe host stamps the UTC timestamp; you supply --msg. This is a LOG ENTRY, not a message — it sends nothing to anyone. Inside a task fire --id is auto-derived from your session. If you wrote or modified files during the run, name them in --msg.',
+        'Append a one-line note to a task run log (tasks/<id>.md).\n\nOptional: a task fire auto-logs its final text, so most runs need no explicit call — use this for mid-run notes (calling it suppresses the final-text auto-log for that fire). The host stamps the UTC timestamp; you supply --msg. This is a LOG ENTRY, not a message — it sends nothing to anyone. Inside a task fire --id is auto-derived from your session.',
       examples: [
         `# Inside a task fire (--id auto-derived) — the run's work-log line:\nncl tasks append-log --msg "posted the daily digest to slack; one feed returned 403, skipped"`,
       ],

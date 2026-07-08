@@ -10,7 +10,13 @@ import fs from 'fs';
 import path from 'path';
 import { describe, it, expect, afterEach } from 'vitest';
 
-import { ensureSchema, getInboundSourceSessionId, migrateMessagesInTable, syncProcessingAcks } from './session-db.js';
+import {
+  ensureSchema,
+  getInboundSourceSessionId,
+  migrateMessagesInTable,
+  syncProcessingAcks,
+  upsertSessionRouting,
+} from './session-db.js';
 
 const TEST_DIR = '/tmp/nanoclaw-session-db-test';
 const DB_PATH = path.join(TEST_DIR, 'inbound.db');
@@ -89,6 +95,49 @@ describe('migrateMessagesInTable', () => {
 
     expect(getInboundSourceSessionId(db, 'legacy-2')).toBeNull();
     expect(getInboundSourceSessionId(db, 'does-not-exist')).toBeNull();
+    db.close();
+  });
+});
+
+describe('session_routing is_task stamp', () => {
+  it('upsert writes is_task, migrating a legacy table without the column', () => {
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+    fs.mkdirSync(TEST_DIR, { recursive: true });
+
+    // Legacy session_routing (pre-is_task).
+    const db = new Database(DB_PATH);
+    db.exec(`CREATE TABLE session_routing (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      channel_type TEXT, platform_id TEXT, thread_id TEXT
+    )`);
+
+    upsertSessionRouting(db, {
+      channel_type: null,
+      platform_id: null,
+      thread_id: 'system:tasks:daily-abc1',
+      is_task: 1,
+    });
+    // Idempotent re-run flips it back off (host overwrites on every wake).
+    upsertSessionRouting(db, { channel_type: 'telegram', platform_id: 't:1', thread_id: null, is_task: 0 });
+
+    const row = db.prepare('SELECT is_task FROM session_routing WHERE id = 1').get() as { is_task: number };
+    expect(row.is_task).toBe(0);
+
+    upsertSessionRouting(db, { channel_type: null, platform_id: null, thread_id: null, is_task: 1 });
+    const row2 = db.prepare('SELECT is_task FROM session_routing WHERE id = 1').get() as { is_task: number };
+    expect(row2.is_task).toBe(1);
+    db.close();
+  });
+
+  it('fresh inbound schema already carries is_task', () => {
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+    fs.mkdirSync(TEST_DIR, { recursive: true });
+    ensureSchema(DB_PATH, 'inbound');
+    const db = new Database(DB_PATH);
+    const cols = (db.prepare("PRAGMA table_info('session_routing')").all() as Array<{ name: string }>).map(
+      (c) => c.name,
+    );
+    expect(cols).toContain('is_task');
     db.close();
   });
 });

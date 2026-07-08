@@ -219,7 +219,11 @@ CREATE TABLE IF NOT EXISTS session_routing (
   id           INTEGER PRIMARY KEY CHECK (id = 1),
   channel_type TEXT,
   platform_id  TEXT,
-  thread_id    TEXT
+  thread_id    TEXT,
+  -- 1 = this session is a task-series session (thread system:tasks:*).
+  -- Stamped by the host so the container never has to sniff the magic
+  -- thread prefix (which fails open when thread_id is absent/renamed).
+  is_task      INTEGER NOT NULL DEFAULT 0
 );
 `;
 

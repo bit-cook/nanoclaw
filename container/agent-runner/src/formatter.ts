@@ -98,10 +98,9 @@ export interface RoutingContext {
   channelType: string | null;
   threadId: string | null;
   inReplyTo: string | null;
-  /** Batch is a task fire — explicit `<message to>` sends must NOT inherit
-   *  inReplyTo (the series id), or the host's task-fire suppression drops
-   *  them as turn-final echoes: zero delivery. Deliberate sends are
-   *  in_reply_to-null, same as the out-of-process MCP send_message path. */
+  /** Batch is a task fire. One-door delivery: only the send_message tool
+   *  delivers from a task session; final-text `<message to>` blocks are inert
+   *  and the final text auto-appends to the series run log. */
   taskFire: boolean;
 }
 

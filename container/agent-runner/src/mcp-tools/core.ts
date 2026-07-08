@@ -53,8 +53,20 @@ function resolveRouting(
   to: string | undefined,
 ): { channel_type: string; platform_id: string; thread_id: string | null; resolvedName: string } | { error: string } {
   if (!to) {
-    // Default: reply to whatever thread/channel this session is bound to.
     const session = getSessionRouting();
+    // Task sessions have no origin chat — "reply in place" is meaningless and
+    // the single-destination shortcut below would silently pick an arbitrary
+    // target. One-door rule: a task fire must name its destination.
+    // Driven by the host-stamped is_task flag (session_routing); the thread
+    // prefix check is only a fallback for hosts that predate the stamp.
+    // (Prefix mirrors TASKS_SYSTEM_THREAD_ID on the host, src/db/sessions.ts —
+    // the two runtimes share no modules.)
+    if (session.is_task === 1 || session.thread_id?.startsWith('system:tasks')) {
+      return {
+        error: `This is a task session — pass to=<destination> explicitly. Options: ${destinationList()}`,
+      };
+    }
+    // Default: reply to whatever thread/channel this session is bound to.
     if (session.channel_type && session.platform_id) {
       return {
         channel_type: session.channel_type,
@@ -95,7 +107,8 @@ function resolveRouting(
 export const sendMessage: McpToolDefinition = {
   tool: {
     name: 'send_message',
-    description: 'Send a message to a named destination. If you have only one destination, you can omit `to`.',
+    description:
+      'Send a message to a named destination. If you have only one destination, you can omit `to` — except in task sessions, where `to` is always required (this tool is the ONLY delivery path there; final text is never sent).',
     inputSchema: {
       type: 'object' as const,
       properties: {

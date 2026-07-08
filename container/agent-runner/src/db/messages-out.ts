@@ -142,21 +142,62 @@ export function getUndeliveredMessages(): MessageOutRow[] {
     .all() as MessageOutRow[];
 }
 
+/** Highest seq across both session DBs — marks "now" for since-queries. */
+export function maxSeq(): number {
+  const maxOut = (getOutboundDb().prepare('SELECT COALESCE(MAX(seq), 0) AS m FROM messages_out').get() as { m: number })
+    .m;
+  const maxIn = (getInboundDb().prepare('SELECT COALESCE(MAX(seq), 0) AS m FROM messages_in').get() as { m: number }).m;
+  return Math.max(maxOut, maxIn);
+}
+
 /**
- * True if a deliberate send with this exact destination + text already exists
- * (an MCP send_message row from the current turn). Used by the task-fire
- * final-text dispatcher to drop the turn-final <message> echo of a send the
- * agent already made — the dedup happens where the duplication originates.
+ * True if the agent invoked `ncl tasks append-log` after `sinceSeq` (the ncl
+ * binary writes each CLI call as a system cli_request row in messages_out).
+ * Guards the task-fire auto-log: an explicit append-log this fire suppresses
+ * the runner's final-text auto-append, so a run is logged exactly once.
  */
-export function hasIdenticalSend(platformId: string, channelType: string, text: string): boolean {
-  const row = getOutboundDb()
+export function hasAppendLogRequestSince(sinceSeq: number): boolean {
+  // LIKE, not equality: a positional invocation (`ncl tasks append-log "..."`)
+  // arrives dash-joined as 'tasks-append-log-<msg…>' — the host dispatcher
+  // resolves the tail as the positional id.
+  const requests = getOutboundDb()
     .prepare(
-      `SELECT 1 FROM messages_out
-        WHERE platform_id = $platform_id AND channel_type = $channel_type
-          AND (in_reply_to IS NULL OR in_reply_to = '')
-          AND json_extract(content, '$.text') = $text
-        LIMIT 1`,
+      `SELECT content FROM messages_out
+        WHERE seq > $since AND kind = 'system'
+          AND json_extract(content, '$.action') = 'cli_request'
+          AND json_extract(content, '$.command') LIKE 'tasks-append-log%'`,
     )
-    .get({ $platform_id: platformId, $channel_type: channelType, $text: text });
-  return row != null;
+    .all({ $since: sinceSeq }) as Array<{ content: string }>;
+  if (requests.length === 0) return false;
+
+  // Only a request that SUCCEEDED counts as "this fire was logged". Correlate
+  // each request with its host response in inbound messages_in (content carries
+  // the requestId + response frame). A request with no readable response yet
+  // still suppresses — the common success case is the response landing after
+  // the turn ends, and double-logging is worse than a rare missed line. Only a
+  // DEFINITIVE failure (frame ok:false) does not suppress.
+  const inbound = getInboundDb();
+  for (const { content } of requests) {
+    let requestId: string | null = null;
+    try {
+      requestId = (JSON.parse(content) as { requestId?: string }).requestId ?? null;
+    } catch {
+      // Malformed request row — can't correlate; suppress conservatively.
+      return true;
+    }
+    if (!requestId) return true;
+
+    const resp = inbound
+      .prepare('SELECT content FROM messages_in WHERE content LIKE $pat ORDER BY seq DESC LIMIT 1')
+      .get({ $pat: `%"requestId":"${requestId}"%` }) as { content: string } | undefined;
+    if (!resp) return true; // pending response → treat as logged
+    try {
+      const frame = (JSON.parse(resp.content) as { frame?: { ok?: boolean } }).frame;
+      if (frame?.ok !== false) return true; // ok:true (or unreadable frame) → logged
+    } catch {
+      return true; // unparseable response — suppress conservatively
+    }
+    // frame.ok === false → this request definitively failed; check the next one.
+  }
+  return false;
 }

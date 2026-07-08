@@ -21,7 +21,7 @@ vi.mock('./container-runner.js', () => ({
 
 vi.mock('./config.js', async () => {
   const actual = await vi.importActual<typeof import('./config.js')>('./config.js');
-  return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-delivery' };
+  return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-delivery', GROUPS_DIR: '/tmp/nanoclaw-test-delivery/groups' };
 });
 
 const TEST_DIR = '/tmp/nanoclaw-test-delivery';
@@ -35,7 +35,7 @@ import {
   createMessagingGroupAgent,
 } from './db/index.js';
 import { getDeliveredIds } from './db/session-db.js';
-import { resolveSession, outboundDbPath, openInboundDb } from './session-manager.js';
+import { resolveSession, resolveTaskSession, outboundDbPath, openInboundDb } from './session-manager.js';
 import { deliverSessionMessages, setDeliveryAdapter } from './delivery.js';
 
 function now(): string {
@@ -339,5 +339,37 @@ describe('deliverSessionMessages — permission check', () => {
     const delivered = getDeliveredIds(inDb);
     inDb.close();
     expect(delivered.has('out-unauth')).toBe(true);
+  });
+});
+
+describe('deliverSessionMessages — task_log rows (one-door task delivery)', () => {
+  it('appends to the series run log and never calls the adapter', async () => {
+    seedAgentAndChannel();
+    const { session } = resolveTaskSession('ag-1', 'daily-digest-a1b2');
+
+    const db = new Database(outboundDbPath('ag-1', session.id));
+    db.prepare(
+      `INSERT INTO messages_out (id, timestamp, kind, content)
+       VALUES ('log-1', datetime('now'), 'task_log', ?)`,
+    ).run(JSON.stringify({ text: 'checked feeds; nothing new' }));
+    db.close();
+
+    const calls: string[] = [];
+    setDeliveryAdapter({
+      async deliver(_c, _p, _t, _k, content) {
+        calls.push(content);
+        return 'pm';
+      },
+    });
+    await deliverSessionMessages(session);
+
+    expect(calls).toHaveLength(0); // a run-log line is not a delivery
+    const logFile = `${TEST_DIR}/groups/test-agent/tasks/daily-digest-a1b2.md`;
+    expect(fs.existsSync(logFile)).toBe(true);
+    const line = fs.readFileSync(logFile, 'utf8').trim();
+    expect(line).toMatch(/^\d{4}-\d{2}-\d{2}T.* — checked feeds; nothing new$/);
+    // Marked delivered — the row is not retried.
+    const delivered = getDeliveredIds(openInboundDb('ag-1', session.id));
+    expect(delivered.has('log-1')).toBe(true);
   });
 });

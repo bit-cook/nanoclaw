@@ -34,7 +34,7 @@ Additional resources (available under `global` scope only): messaging-groups, wi
 - **Restarting your container** — `ncl groups restart` (with optional `--rebuild` and `--message`).
 - **Checking who's in your group** — `ncl members list`.
 - **Seeing your destinations** — `ncl destinations list`.
-- **Scheduling work** — `ncl tasks create`, then `ncl tasks list/get/update/cancel/pause/resume/delete`; `ncl tasks run <id>` fires one extra run now (testing) without changing the schedule. At the end of each task run, `ncl tasks append-log --msg "…"` to record what happened (host-timestamped, not a message).
+- **Scheduling work** — `ncl tasks create`, then `ncl tasks list/get/update/cancel/pause/resume/delete`; `ncl tasks run <id>` fires one extra run now (testing) without changing the schedule. Each task run auto-logs its final text to the run log; `ncl tasks append-log --msg "…"` is for extra mid-run notes (host-timestamped, not a message).
 - **Answering questions about the system** — query `ncl` rather than guessing.
 
 ### Access rules

@@ -40,17 +40,31 @@ export function openOutboundDbRw(dbPath: string): Database.Database {
   return db;
 }
 
+/**
+ * Lazy, on-open migration for session_routing (mirrors migrateMessagesInTable):
+ * pre-existing session DBs lack the is_task column. Idempotent; no-op when the
+ * table itself is missing (older DBs error on upsert exactly as before).
+ */
+export function migrateSessionRoutingTable(db: Database.Database): void {
+  const cols = (db.prepare("PRAGMA table_info('session_routing')").all() as Array<{ name: string }>).map((c) => c.name);
+  if (cols.length > 0 && !cols.includes('is_task')) {
+    db.prepare('ALTER TABLE session_routing ADD COLUMN is_task INTEGER NOT NULL DEFAULT 0').run();
+  }
+}
+
 export function upsertSessionRouting(
   db: Database.Database,
-  routing: { channel_type: string | null; platform_id: string | null; thread_id: string | null },
+  routing: { channel_type: string | null; platform_id: string | null; thread_id: string | null; is_task: 0 | 1 },
 ): void {
+  migrateSessionRoutingTable(db);
   db.prepare(
-    `INSERT INTO session_routing (id, channel_type, platform_id, thread_id)
-     VALUES (1, @channel_type, @platform_id, @thread_id)
+    `INSERT INTO session_routing (id, channel_type, platform_id, thread_id, is_task)
+     VALUES (1, @channel_type, @platform_id, @thread_id, @is_task)
      ON CONFLICT(id) DO UPDATE SET
        channel_type = excluded.channel_type,
        platform_id  = excluded.platform_id,
-       thread_id    = excluded.thread_id`,
+       thread_id    = excluded.thread_id,
+       is_task      = excluded.is_task`,
   ).run(routing);
 }
 
