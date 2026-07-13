@@ -285,6 +285,11 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         thread_id: routing.threadId,
         content: JSON.stringify({ text: `Error: ${errMsg}` }),
       });
+
+      // The batch is still acked completed below (no redelivery). Without
+      // this line the only log trace of the errored turn is "Query error"
+      // followed by a "Completed" line that reads like success.
+      log(`Errored batch will be acked completed — ${processingIds.length} message(s), no redelivery`);
     } finally {
       clearCurrentInReplyTo();
     }
